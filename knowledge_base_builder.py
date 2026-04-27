@@ -11,9 +11,9 @@ Kimi API 知识库构建脚本
 
 【Kimi API 关键配置】
 - 模型名称：kimi-k2.6
-- Base URL：https://api.moonshot.ai/v1
+- Base URL：https://api.moonshot.cn/v1
 - JSON Mode：response_format={"type": "json_object"}
-- 联网搜索：builtin_function.$web_search（需配合 thinking={"type":"disabled"}）
+- 联网搜索：builtin_function.$web_search（需通过 extra_body 传 thinking={"type":"disabled"}）
 - SDK：OpenAI Python SDK 兼容（pip install openai）
 - API Key：通过环境变量 MOONSHOT_API_KEY 读取
 
@@ -56,13 +56,15 @@ from tqdm import tqdm
 # 全局常量配置
 # ==============================================================================
 MODEL_NAME = "kimi-k2.6"  # Kimi API 模型名称
-BASE_URL = "https://api.moonshot.ai/v1"  # Kimi API Base URL
+BASE_URL = "https://api.moonshot.cn/v1"  # Kimi API Base URL（可被 MOONSHOT_BASE_URL 覆盖）
 DEFAULT_MAX_QUESTIONS = 300  # 默认最大问题数（初级100+中级100+高级100）
 DEFAULT_AUDIENCE = "beginner"  # 默认目标受众
 DEFAULT_OUTPUT = "./knowledge_base.jsonl"  # 默认输出文件路径
 QUESTIONS_PER_LEVEL = 100  # 每个级别生成的问题数量
 FLUSH_INTERVAL = 10  # 每 N 条记录强制刷新磁盘
 COST_REPORT_INTERVAL = 20  # 每 N 个问题报告一次累计消耗
+MAX_WEB_SEARCH_TOOL_ROUNDS = 6  # 联网搜索工具调用的最大回合数（防止死循环）
+STREAM_LOG_CHUNK_INTERVAL = 20  # 流式输出每 N 个 chunk 打印一次进度日志
 
 # Token 消耗估算参数（用于成本预估）
 AVG_INPUT_TOKENS_PER_QUESTION = 800  # 每个问题平均输入 token
@@ -71,6 +73,11 @@ AVG_INPUT_TOKENS_RESEARCH = 500  # 调研阶段平均输入 token
 AVG_OUTPUT_TOKENS_RESEARCH = 800  # 调研阶段平均输出 token
 AVG_INPUT_TOKENS_GENERATE = 400  # 问题生成阶段平均输入 token
 AVG_OUTPUT_TOKENS_GENERATE = 1200  # 问题生成阶段平均输出 token
+MIN_RESEARCH_SUMMARY_BYTES = 200  # 阶段1调研摘要最小字节阈值（低于该值视为失败）
+
+
+class ResearchQualityError(Exception):
+    """阶段 1 调研质量不达标异常（需终止流程）。"""
 
 
 class KnowledgeBaseBuilder:
@@ -85,12 +92,13 @@ class KnowledgeBaseBuilder:
     """
 
     @staticmethod
-    def _load_env_file(env_path: str) -> None:
+    def _load_env_file(env_path: str, override: bool = True) -> None:
         """
-        从 .env 文件加载环境变量（仅在系统环境变量不存在时设置）
+        从 .env 文件加载环境变量
 
         Args:
             env_path: .env 文件路径
+            override: 若为 True，则使用 .env 值覆盖现有同名环境变量
         """
         if not os.path.exists(env_path):
             return
@@ -106,7 +114,10 @@ class KnowledgeBaseBuilder:
                     key = key.strip()
                     value = value.strip().strip('"').strip("'")
 
-                    if key and key not in os.environ:
+                    if not key:
+                        continue
+
+                    if override or key not in os.environ:
                         os.environ[key] = value
         except Exception as e:
             print(f"[警告] 读取 .env 文件失败（{env_path}）：{e}")
@@ -118,6 +129,8 @@ class KnowledgeBaseBuilder:
         output_path: str = DEFAULT_OUTPUT,
         resume_from: int = 0,
         max_questions: int = DEFAULT_MAX_QUESTIONS,
+        enable_stream: bool = True,
+        verbose: bool = True,
     ):
         """
         初始化构建器
@@ -128,12 +141,16 @@ class KnowledgeBaseBuilder:
             output_path: 输出文件路径
             resume_from: 断点续传起始序号（0 表示从头开始）
             max_questions: 最大问题数限制
+            enable_stream: 是否启用流式输出
+            verbose: 是否输出详细调试日志
         """
         self.topic = topic
         self.audience = audience
         self.output_path = output_path
         self.resume_from = resume_from
         self.max_questions = max_questions
+        self.enable_stream = enable_stream
+        self.verbose = verbose
 
         # 统计计数器
         self.total_api_calls = 0  # API 总调用次数
@@ -141,18 +158,20 @@ class KnowledgeBaseBuilder:
         self.total_output_tokens = 0  # 累计输出 token
         self.start_time = time.time()  # 起始时间戳
 
-        # 先尝试从脚本目录和当前工作目录读取 .env
+        # 先尝试从脚本目录和当前工作目录读取 .env（以 .env 为准，避免旧环境变量干扰）
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        self._load_env_file(os.path.join(script_dir, ".env"))
+        self._load_env_file(os.path.join(script_dir, ".env"), override=True)
         if os.getcwd() != script_dir:
-            self._load_env_file(os.path.join(os.getcwd(), ".env"))
+            self._load_env_file(os.path.join(os.getcwd(), ".env"), override=True)
 
         # 初始化 OpenAI 客户端（Kimi API 兼容模式）
         api_key = os.environ.get("MOONSHOT_API_KEY")
+        self.base_url = os.environ.get("MOONSHOT_BASE_URL", BASE_URL)
         if not api_key:
             print(
                 "[错误] 未找到环境变量 MOONSHOT_API_KEY。\n"
                 "请在项目根目录创建 .env 并写入：MOONSHOT_API_KEY=your-key\n"
+                "可选：通过 MOONSHOT_BASE_URL 指定 API 地址（默认 https://api.moonshot.cn/v1）\n"
                 "Linux/macOS: export MOONSHOT_API_KEY='your-key'\n"
                 "PowerShell: $env:MOONSHOT_API_KEY='your-key'"
             )
@@ -160,7 +179,7 @@ class KnowledgeBaseBuilder:
 
         self.client = OpenAI(
             api_key=api_key,
-            base_url=BASE_URL,
+            base_url=self.base_url,
         )
 
         # 初始化输出文件（追加模式，支持断点续传）
@@ -170,12 +189,175 @@ class KnowledgeBaseBuilder:
         # 阶段 2 生成的问题清单缓存
         self.all_questions: list[dict[str, Any]] = []
 
-        # 是否已经打印过 thinking 参数兼容提示（避免重复刷屏）
-        self._thinking_compat_warned = False
+    def _log(self, message: str, level: str = "INFO") -> None:
+        """
+        统一日志输出（支持按 verbose 开关控制）。
+        """
+        if not self.verbose and level == "DEBUG":
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{level} {ts}] {message}")
+
+    def _create_chat_completion_streaming(
+        self,
+        kwargs: dict[str, Any],
+    ) -> ChatCompletion:
+        """
+        通过 stream=True 执行请求，并将 chunks 聚合为 ChatCompletion。
+        """
+        kwargs = dict(kwargs)
+        kwargs["stream"] = True
+
+        self._log("开始流式请求，等待首个 chunk...", "DEBUG")
+        stream = cast(Any, self.client.chat.completions.create(**kwargs))
+
+        content_parts: list[str] = []
+        finish_reason: str | None = None
+        role = "assistant"
+        usage_dict: dict[str, Any] | None = None
+        tool_calls_acc: dict[int, dict[str, Any]] = {}
+        chunk_count = 0
+
+        for chunk in stream:
+            chunk_any: Any = chunk
+            chunk_dict: dict[str, Any] = chunk_any.model_dump(exclude_none=True)
+            chunk_count += 1
+            if chunk_count == 1:
+                self._log("已收到首个 chunk，开始持续输出。", "INFO")
+            elif chunk_count % STREAM_LOG_CHUNK_INTERVAL == 0:
+                self._log(
+                    f"流式进度：已接收 {chunk_count} 个 chunks，累计文本长度 {sum(len(x) for x in content_parts)} 字符",
+                    "DEBUG",
+                )
+
+            choices = chunk_dict.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+
+            choice0 = cast(dict[str, Any], choices[0])
+
+            fr = choice0.get("finish_reason")
+            if isinstance(fr, str):
+                finish_reason = fr
+
+            delta = cast(dict[str, Any], choice0.get("delta", {}))
+            delta_role = delta.get("role")
+            if isinstance(delta_role, str) and delta_role:
+                role = delta_role
+
+            delta_content = delta.get("content")
+            if isinstance(delta_content, str) and delta_content:
+                content_parts.append(delta_content)
+
+            delta_tool_calls = delta.get("tool_calls")
+            if isinstance(delta_tool_calls, list):
+                for tc_dict in cast(list[dict[str, Any]], delta_tool_calls):
+                    tc_index = int(tc_dict.get("index", 0))
+
+                    acc = tool_calls_acc.setdefault(
+                        tc_index,
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+
+                    if "id" in tc_dict:
+                        acc["id"] = tc_dict["id"]
+                    if "type" in tc_dict:
+                        acc["type"] = tc_dict["type"]
+
+                    fn_raw = tc_dict.get("function", {})
+                    fn: dict[str, Any] = cast(dict[str, Any], fn_raw) if isinstance(fn_raw, dict) else {}
+                    if "name" in fn:
+                        acc["function"]["name"] = fn["name"]
+                    if "arguments" in fn:
+                        acc["function"]["arguments"] += fn["arguments"]
+
+            usage_candidate_raw = chunk_dict.get("usage")
+            if isinstance(usage_candidate_raw, dict):
+                usage_dict = cast(dict[str, Any], usage_candidate_raw)
+
+            choice_usage_candidate = (
+                cast(dict[str, Any], cast(list[Any], choices)[0]).get("usage")
+                if choices
+                else None
+            )
+            if isinstance(choice_usage_candidate, dict):
+                usage_dict = cast(dict[str, Any], choice_usage_candidate)
+
+        self._log(
+            f"流式请求完成：chunks={chunk_count}, finish_reason={finish_reason}, content_len={sum(len(x) for x in content_parts)}",
+            "INFO",
+        )
+
+        message: dict[str, Any] = {
+            "role": role,
+            "content": "".join(content_parts),
+        }
+        if tool_calls_acc:
+            message["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+
+        response_dict: dict[str, Any] = {
+            "id": f"stream-assembled-{int(time.time() * 1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": MODEL_NAME,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": finish_reason or "stop",
+                    "message": message,
+                }
+            ],
+        }
+
+        if usage_dict:
+            response_dict["usage"] = usage_dict
+
+        return ChatCompletion.model_validate(response_dict)
 
     # ==========================================================================
     # 底层 API 调用方法（带指数退避重试）
     # ==========================================================================
+
+    def _create_chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        enable_json_mode: bool,
+        enable_web_search: bool,
+    ) -> ChatCompletion:
+        """
+        执行一次 Chat Completions 请求。
+        """
+        kwargs: dict[str, Any] = {
+            "model": MODEL_NAME,
+            "messages": messages,
+        }
+
+        if enable_json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        if enable_web_search:
+            kwargs["tools"] = [
+                {
+                    "type": "builtin_function",
+                    "function": {"name": "$web_search"},
+                }
+            ]
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+
+        mode = "stream" if self.enable_stream else "non-stream"
+        self._log(
+            f"发起 {mode} 请求（json_mode={enable_json_mode}, web_search={enable_web_search}, messages={len(messages)}）",
+            "DEBUG",
+        )
+
+        if self.enable_stream:
+            return self._create_chat_completion_streaming(kwargs)
+
+        return cast(ChatCompletion, self.client.chat.completions.create(**kwargs))
 
     @retry(
         retry=retry_if_exception_type(
@@ -204,44 +386,75 @@ class KnowledgeBaseBuilder:
         Returns:
             OpenAI API 返回的完整 response 对象（字典形式）
         """
-        messages = [
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
-        # 构建请求参数
-        kwargs: dict[str, Any] = {
-            "model": MODEL_NAME,
-            "messages": messages,
-        }
+        # 首次请求
+        response = self._create_chat_completion(
+            messages=messages,
+            enable_json_mode=enable_json_mode,
+            enable_web_search=enable_web_search,
+        )
 
-        # 启用 JSON Mode（强制模型输出合法 JSON）
-        if enable_json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-
-        # 启用联网搜索（必须关闭 thinking）
+        # 若启用了联网搜索，处理 tool_calls 闭环，直到得到最终可读回复
         if enable_web_search:
-            kwargs["tools"] = [
-                {
-                    "type": "builtin_function",
-                    "function": {"name": "$web_search"},
-                }
-            ]
-            kwargs["thinking"] = {"type": "disabled"}
+            for round_idx in range(MAX_WEB_SEARCH_TOOL_ROUNDS):
+                self._log(
+                    f"web_search 工具回合 {round_idx + 1}/{MAX_WEB_SEARCH_TOOL_ROUNDS}",
+                    "DEBUG",
+                )
+                if not response.choices:
+                    break
 
-        # 执行 API 调用
-        try:
-            response = cast(ChatCompletion, self.client.chat.completions.create(**kwargs))
-        except TypeError as e:
-            # 部分 API 兼容层不支持 thinking 参数，自动降级重试
-            if enable_web_search and "unexpected keyword argument 'thinking'" in str(e):
-                kwargs.pop("thinking", None)
-                if not self._thinking_compat_warned:
-                    print("[提示] 当前接口不支持 thinking 参数，已自动降级为不传 thinking。")
-                    self._thinking_compat_warned = True
-                response = cast(ChatCompletion, self.client.chat.completions.create(**kwargs))
-            else:
-                raise
+                choice = response.choices[0]
+                if choice.finish_reason != "tool_calls":
+                    break
+
+                assistant_msg = choice.message.model_dump(exclude_none=True)
+                messages.append(assistant_msg)
+
+                tool_calls = choice.message.tool_calls or []
+                if not tool_calls:
+                    break
+
+                self._log(f"检测到 {len(tool_calls)} 个 tool_calls，开始回填。", "DEBUG")
+
+                for tool_call in tool_calls:
+                    tool_call_dict = tool_call.model_dump(exclude_none=True)
+                    function_dict = cast(dict[str, Any], tool_call_dict.get("function", {}))
+                    tool_name = str(function_dict.get("name", "$web_search"))
+                    raw_arguments = function_dict.get("arguments", "{}")
+                    tool_arguments = raw_arguments if isinstance(raw_arguments, str) else "{}"
+                    tool_call_id = str(tool_call_dict.get("id", ""))
+
+                    # 对于内置 $web_search：按官方流程将 arguments 原样回传（标准化为 JSON 字符串）
+                    try:
+                        tool_result_obj = json.loads(tool_arguments)
+                        tool_content = json.dumps(tool_result_obj, ensure_ascii=False)
+                    except Exception:
+                        tool_content = tool_arguments
+
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": tool_name,
+                            "content": tool_content,
+                        }
+                    )
+
+                response = self._create_chat_completion(
+                    messages=messages,
+                    enable_json_mode=enable_json_mode,
+                    enable_web_search=enable_web_search,
+                )
+
+            if response.choices and response.choices[0].finish_reason == "tool_calls":
+                raise RuntimeError(
+                    f"联网搜索工具调用超过最大回合数（{MAX_WEB_SEARCH_TOOL_ROUNDS}），已终止以避免死循环。"
+                )
 
         self.total_api_calls += 1
 
@@ -250,6 +463,12 @@ class KnowledgeBaseBuilder:
         if usage:
             self.total_input_tokens += usage.prompt_tokens
             self.total_output_tokens += usage.completion_tokens
+            self._log(
+                f"usage 统计：prompt={usage.prompt_tokens}, completion={usage.completion_tokens}, total={usage.total_tokens}",
+                "DEBUG",
+            )
+
+        self._log("本次 API 调用完成。", "DEBUG")
 
         return response
 
@@ -271,8 +490,27 @@ class KnowledgeBaseBuilder:
         if self._is_auth_error(error):
             raise RuntimeError(
                 "MOONSHOT_API_KEY 鉴权失败（401 Invalid Authentication）。"
-                "请检查 Key 是否正确、是否过期、是否与当前 Base URL 匹配。"
+                f"请检查 Key 是否正确、是否过期、是否与当前 Base URL 匹配（当前：{self.base_url}）。"
+                "若你使用的是 Moonshot 新版平台，请优先使用 https://api.moonshot.cn/v1。"
             ) from error
+
+    @staticmethod
+    def _validate_research_summary(summary: str) -> None:
+        """
+        校验阶段 1 调研摘要质量（按字节数阈值判断）
+
+        Args:
+            summary: 调研摘要文本
+
+        Raises:
+            ResearchQualityError: 摘要为空或字节数低于阈值
+        """
+        size_bytes = len(summary.encode("utf-8"))
+        if size_bytes < MIN_RESEARCH_SUMMARY_BYTES:
+            raise ResearchQualityError(
+                "阶段 1 调研结果过短，疑似异常。"
+                f"当前摘要字节数：{size_bytes}，最小要求：{MIN_RESEARCH_SUMMARY_BYTES}。"
+            )
 
     @staticmethod
     def _extract_message_content(response: ChatCompletion, default: str = "") -> str:
@@ -437,6 +675,7 @@ class KnowledgeBaseBuilder:
                 enable_web_search=True,
             )
             content = self._extract_message_content(response)
+            self._validate_research_summary(content)
             print("[阶段 1] 调研完成，摘要长度：{} 字符".format(len(content)))
 
             research_record: dict[str, Any] = {
@@ -451,6 +690,8 @@ class KnowledgeBaseBuilder:
 
         except Exception as e:
             self._raise_if_auth_error(e)
+            if isinstance(e, ResearchQualityError):
+                raise RuntimeError(f"阶段 1 调研失败：{e}") from e
             print(f"[错误] 阶段 1 调研失败：{e}")
             # 即使调研失败，也记录错误并继续，使用降级内容
             fallback_record: dict[str, Any] = {
@@ -752,6 +993,8 @@ class KnowledgeBaseBuilder:
         print(f"输出：{os.path.abspath(self.output_path)}")
         print(f"断点续传：从第 {self.resume_from} 个问题开始")
         print(f"最大问题数：{self.max_questions}")
+        print(f"流式输出：{self.enable_stream}")
+        print(f"详细日志：{self.verbose}")
         print("=" * 60)
 
         try:
@@ -809,7 +1052,7 @@ class KnowledgeBaseBuilder:
             # 确保缓冲区数据落盘
             self.output_file.flush()
             os.fsync(self.output_file.fileno())
-            raise
+            sys.exit(1)
 
         finally:
             # 确保文件正确关闭
@@ -907,6 +1150,18 @@ def main() -> None:
         default=DEFAULT_MAX_QUESTIONS,
         help=f"最大问题数限制（默认：{DEFAULT_MAX_QUESTIONS}，即三级各100个）",
     )
+    parser.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否启用流式输出（默认：启用）",
+    )
+    parser.add_argument(
+        "--verbose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否输出详细调试日志（默认：启用）",
+    )
 
     args = parser.parse_args()
 
@@ -925,6 +1180,8 @@ def main() -> None:
         output_path=args.output,
         resume_from=args.resume,
         max_questions=args.max_questions,
+        enable_stream=args.stream,
+        verbose=args.verbose,
     )
     builder.run()
 

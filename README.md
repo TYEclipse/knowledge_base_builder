@@ -66,9 +66,11 @@ Copy-Item .\.env.example .\.env
 
 ```dotenv
 MOONSHOT_API_KEY=你的-api-key
+# 可选：不填则默认使用 https://api.moonshot.cn/v1
+# MOONSHOT_BASE_URL=https://api.moonshot.cn/v1
 ```
 
-你也可以临时使用环境变量（会覆盖 `.env` 同名值）：
+你也可以临时使用环境变量（但脚本启动时会优先读取并采用 `.env` 中的值）：
 
 ```powershell
 $env:MOONSHOT_API_KEY = "你的-api-key"
@@ -156,9 +158,10 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 MOONSHOT_API_KEY=你的-api-key
 ```
 
-如果要临时覆盖，再在当前终端设置：
+如果你在终端里设置过旧值，请优先更新 `.env`，或先清理当前会话中的旧环境变量后再运行：
 
 ```powershell
+Remove-Item Env:MOONSHOT_API_KEY -ErrorAction SilentlyContinue
 $env:MOONSHOT_API_KEY = "你的-api-key"
 ```
 
