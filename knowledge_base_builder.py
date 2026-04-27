@@ -39,9 +39,11 @@ import os
 import re
 import sys
 import time
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from typing import Any, Optional, cast
 
+import httpx
 import openai
 from openai import OpenAI
 from openai.types.chat.chat_completion import ChatCompletion
@@ -67,6 +69,12 @@ COST_REPORT_INTERVAL = 20  # 每 N 个问题报告一次累计消耗
 MAX_WEB_SEARCH_TOOL_ROUNDS = 6  # 联网搜索工具调用的最大回合数（防止死循环）
 STREAM_LOG_CHUNK_INTERVAL = 20  # 流式输出每 N 个 chunk 打印一次进度日志
 DISABLE_THINKING_BY_DEFAULT = True  # 默认禁用 thinking，避免长时间仅输出 reasoning_content
+MAX_TOKENS_RESEARCH = 1800  # 阶段1调研输出上限
+MAX_TOKENS_GENERATE_QUESTIONS = 3200  # 阶段2问题清单输出上限
+MAX_TOKENS_SEARCH = 1200  # 阶段3搜索摘要输出上限
+MAX_TOKENS_ANALYSIS = 1600  # 阶段3结构化分析输出上限
+MAX_RESEARCH_SUMMARY_PROMPT_CHARS = 3000  # 注入提示词的调研摘要最大字符数
+MAX_SEARCH_RESULT_PROMPT_CHARS = 2500  # 注入提示词的搜索结果最大字符数
 
 # Token 消耗估算参数（用于成本预估）
 AVG_INPUT_TOKENS_PER_QUESTION = 800  # 每个问题平均输入 token
@@ -76,6 +84,7 @@ AVG_OUTPUT_TOKENS_RESEARCH = 800  # 调研阶段平均输出 token
 AVG_INPUT_TOKENS_GENERATE = 400  # 问题生成阶段平均输入 token
 AVG_OUTPUT_TOKENS_GENERATE = 1200  # 问题生成阶段平均输出 token
 MIN_RESEARCH_SUMMARY_BYTES = 200  # 阶段1调研摘要最小字节阈值（低于该值视为失败）
+BALANCE_ENDPOINT = "/users/me/balance"  # 查询账户余额接口
 
 
 class ResearchQualityError(Exception):
@@ -186,6 +195,7 @@ class KnowledgeBaseBuilder:
             api_key=api_key,
             base_url=self.base_url,
         )
+        self.api_key = api_key
 
         # 初始化输出文件（追加模式，支持断点续传）
         self.output_file = open(self.output_path, "a", encoding="utf-8")
@@ -318,6 +328,134 @@ class KnowledgeBaseBuilder:
             return
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{level} {ts}] {message}")
+
+    @staticmethod
+    def _to_decimal(value: Any) -> Optional[Decimal]:
+        """将余额字段安全转换为 Decimal。"""
+        if value is None:
+            return None
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _pick_balance_value(data: dict[str, Any], candidates: list[str]) -> Optional[Decimal]:
+        """按候选字段名提取余额值。"""
+        for key in candidates:
+            if key in data:
+                parsed = KnowledgeBaseBuilder._to_decimal(data.get(key))
+                if parsed is not None:
+                    return parsed
+        return None
+
+    def _fetch_balance(self) -> Optional[dict[str, Decimal]]:
+        """调用余额接口，返回可用/代金券/现金余额。"""
+        url = self.base_url.rstrip("/") + BALANCE_ENDPOINT
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        try:
+            with httpx.Client(timeout=20.0) as client:
+                resp = client.get(url, headers=headers)
+                resp.raise_for_status()
+
+            payload = cast(dict[str, Any], resp.json())
+            data = cast(dict[str, Any], payload.get("data", {}))
+
+            available = self._pick_balance_value(
+                data,
+                ["available_balance", "availableBalance", "available", "balance"],
+            )
+            voucher = self._pick_balance_value(
+                data,
+                ["voucher_balance", "voucherBalance", "voucher"],
+            )
+            cash = self._pick_balance_value(
+                data,
+                ["cash_balance", "cashBalance", "cash"],
+            )
+
+            result: dict[str, Decimal] = {}
+            if available is not None:
+                result["available"] = available
+            if voucher is not None:
+                result["voucher"] = voucher
+            if cash is not None:
+                result["cash"] = cash
+
+            if not result:
+                self._log("余额接口返回成功，但未识别到余额字段。", "WARNING")
+                return None
+
+            return result
+        except Exception as e:
+            self._log(f"查询余额失败：{e}", "WARNING")
+            return None
+
+    @staticmethod
+    def _format_decimal(value: Decimal) -> str:
+        """格式化余额显示。"""
+        return f"{value:.4f}"
+
+    def _print_balance_snapshot(self, title: str, balance: Optional[dict[str, Decimal]]) -> None:
+        """打印余额快照。"""
+        print("\n" + "=" * 60)
+        print(f"💰 {title}")
+        print("=" * 60)
+        if not balance:
+            print("余额查询失败或字段无法解析。")
+            print("=" * 60)
+            return
+
+        available = balance.get("available")
+        voucher = balance.get("voucher")
+        cash = balance.get("cash")
+        if available is not None:
+            print(f"可用余额：{self._format_decimal(available)}")
+        if voucher is not None:
+            print(f"代金券余额：{self._format_decimal(voucher)}")
+        if cash is not None:
+            print(f"现金余额：{self._format_decimal(cash)}")
+        print("=" * 60)
+
+    def _print_balance_delta(
+        self,
+        before: Optional[dict[str, Decimal]],
+        after: Optional[dict[str, Decimal]],
+    ) -> None:
+        """打印余额差值（花费）。"""
+        print("\n" + "=" * 60)
+        print("🧾 本次执行余额变化")
+        print("=" * 60)
+
+        if not before or not after:
+            print("余额快照不完整，无法计算本次花费。")
+            print("=" * 60)
+            return
+
+        keys = ["available", "voucher", "cash"]
+        labels = {
+            "available": "可用余额变化",
+            "voucher": "代金券变化",
+            "cash": "现金余额变化",
+        }
+
+        has_any = False
+        for key in keys:
+            if key in before and key in after:
+                delta = before[key] - after[key]
+                has_any = True
+                print(f"{labels[key]}：{self._format_decimal(delta)}")
+
+        if "available" in before and "available" in after:
+            spent = before["available"] - after["available"]
+            print(f"本次总花费（按可用余额差值）：{self._format_decimal(spent)}")
+        elif not has_any:
+            print("缺少可用余额字段，无法计算总花费。")
+
+        print("=" * 60)
 
     def _create_chat_completion_streaming(
         self,
@@ -464,6 +602,7 @@ class KnowledgeBaseBuilder:
         messages: list[dict[str, Any]],
         enable_json_mode: bool,
         enable_web_search: bool,
+        max_tokens: Optional[int] = None,
     ) -> ChatCompletion:
         """
         执行一次 Chat Completions 请求。
@@ -472,6 +611,9 @@ class KnowledgeBaseBuilder:
             "model": MODEL_NAME,
             "messages": messages,
         }
+
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
 
         if enable_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -492,7 +634,7 @@ class KnowledgeBaseBuilder:
 
         mode = "stream" if self.enable_stream else "non-stream"
         self._log(
-            f"发起 {mode} 请求（json_mode={enable_json_mode}, web_search={enable_web_search}, messages={len(messages)}）",
+            f"发起 {mode} 请求（json_mode={enable_json_mode}, web_search={enable_web_search}, messages={len(messages)}, max_tokens={max_tokens}）",
             "DEBUG",
         )
 
@@ -515,6 +657,7 @@ class KnowledgeBaseBuilder:
         user_prompt: str,
         enable_json_mode: bool = False,
         enable_web_search: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> ChatCompletion:
         """
         底层 API 调用封装（带 tenacity 指数退避重试）
@@ -524,6 +667,7 @@ class KnowledgeBaseBuilder:
             user_prompt: 用户提示词
             enable_json_mode: 是否启用 JSON Mode
             enable_web_search: 是否启用联网搜索
+            max_tokens: 限制输出 token 数，避免过长输出
 
         Returns:
             OpenAI API 返回的完整 response 对象（字典形式）
@@ -538,6 +682,7 @@ class KnowledgeBaseBuilder:
             messages=messages,
             enable_json_mode=enable_json_mode,
             enable_web_search=enable_web_search,
+            max_tokens=max_tokens,
         )
 
         # 若启用了联网搜索，处理 tool_calls 闭环，直到得到最终可读回复
@@ -591,6 +736,7 @@ class KnowledgeBaseBuilder:
                     messages=messages,
                     enable_json_mode=enable_json_mode,
                     enable_web_search=enable_web_search,
+                    max_tokens=max_tokens,
                 )
 
             if response.choices and response.choices[0].finish_reason == "tool_calls":
@@ -653,6 +799,13 @@ class KnowledgeBaseBuilder:
                 "阶段 1 调研结果过短，疑似异常。"
                 f"当前摘要字节数：{size_bytes}，最小要求：{MIN_RESEARCH_SUMMARY_BYTES}。"
             )
+
+    @staticmethod
+    def _truncate_for_prompt(text: str, limit: int) -> str:
+        """截断注入到后续提示词中的长文本，避免上下文与输出无效膨胀。"""
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "\n...(以下内容已截断)..."
 
     @staticmethod
     def _extract_message_content(response: ChatCompletion, default: str = "") -> str:
@@ -815,6 +968,7 @@ class KnowledgeBaseBuilder:
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 enable_web_search=True,
+                max_tokens=MAX_TOKENS_RESEARCH,
             )
             content = self._extract_message_content(response)
             self._validate_research_summary(content)
@@ -880,6 +1034,7 @@ class KnowledgeBaseBuilder:
             print(
                 f"\n[阶段 2] 正在生成 {level_cn} 级别（{level_en}）的 {QUESTIONS_PER_LEVEL} 个问题..."
             )
+            self._log(f"阶段2开始：生成 {level_cn} 问题清单", "INFO")
 
             system_prompt = (
                 f"你是 {self.topic} 领域的专家。"
@@ -889,12 +1044,13 @@ class KnowledgeBaseBuilder:
 
             user_prompt = (
                 f"基于以下调研摘要，生成 {self.topic} 的 {level_cn}（{level_en}）100 个问题清单。\n\n"
-                f"调研摘要：\n{research_summary}\n\n"
+                f"调研摘要：\n{self._truncate_for_prompt(research_summary, MAX_RESEARCH_SUMMARY_PROMPT_CHARS)}\n\n"
                 f"要求：\n"
                 f"1. 问题应覆盖该主题在 {level_cn} 阶段必须掌握的核心知识点\n"
                 f"2. 问题应具体、明确，便于后续逐一深度分析\n"
                 f"3. 问题难度应符合 {level_cn} 水平\n"
-                f"4. 只输出 JSON，不要有任何其他文字\n\n"
+                f"4. 每个问题尽量简洁，建议控制在 10~30 个汉字内\n"
+                f"5. 只输出 JSON，不要有任何其他文字\n\n"
                 f"输出格式（严格遵守）：\n"
                 f'{{"level":"{level_en}","topic":"{self.topic}","questions":["问题1","问题2",...]}}'
             )
@@ -904,6 +1060,7 @@ class KnowledgeBaseBuilder:
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     enable_json_mode=True,
+                    max_tokens=MAX_TOKENS_GENERATE_QUESTIONS,
                 )
                 content = self._extract_message_content(response, default="{}")
                 parsed = self._safe_parse_json(content)
@@ -1025,15 +1182,21 @@ class KnowledgeBaseBuilder:
                 f"请搜索网页，搜索以下问题的相关资料和权威解释：\n"
                 f"主题：{self.topic}\n"
                 f"问题：{question_text}\n\n"
-                f"请基于搜索结果，提供该问题的背景信息、核心概念解释、以及可能的答案要点。"
+                f"请基于搜索结果，输出一份精简摘要，要求：\n"
+                f"1. 总长度控制在 300~600 字内\n"
+                f"2. 只保留与该问题直接相关的信息\n"
+                f"3. 优先给出定义、关键结论、核心事实、最多 5 条要点\n"
+                f"4. 不要展开泛泛而谈，不要输出无关背景。"
             )
 
             search_result_text = ""
             try:
+                self._log(f"阶段3-搜索：问题 {q_id} 开始搜索摘要", "INFO")
                 search_response = self._call_api(
                     system_prompt=f"你是 {self.topic} 领域的专家，擅长通过搜索获取权威信息。",
                     user_prompt=search_prompt,
                     enable_web_search=True,
+                    max_tokens=MAX_TOKENS_SEARCH,
                 )
                 search_result_text = self._extract_message_content(search_response)
             except Exception as e:
@@ -1051,16 +1214,21 @@ class KnowledgeBaseBuilder:
             analysis_user_prompt = (
                 f"请深度分析以下问题，并严格按照 JSON 格式输出：\n\n"
                 f"主题：{self.topic}\n"
-                f"阶段1调研摘要：\n{self.research_summary}\n\n"
+                f"阶段1调研摘要：\n{self._truncate_for_prompt(self.research_summary, MAX_RESEARCH_SUMMARY_PROMPT_CHARS)}\n\n"
                 f"问题：{question_text}\n"
                 f"级别：{level}\n\n"
-                f"搜索结果参考：\n{search_result_text}\n\n"
+                f"搜索结果参考：\n{self._truncate_for_prompt(search_result_text, MAX_SEARCH_RESULT_PROMPT_CHARS)}\n\n"
+                f"输出要求：\n"
+                f"1. analysis 字段控制在 200~500 字\n"
+                f"2. key_points 最多 5 条\n"
+                f"3. sources 最多 3 条\n"
+                f"4. 只保留与当前问题最直接相关的信息\n\n"
                 f"输出格式（必须严格遵守，确保是合法 JSON）：\n"
                 f"{{\n"
                 f'  "id": {q_id},\n'
                 f'  "level": "{level}",\n'
                 f'  "question": "{question_text}",\n'
-                f'  "analysis": "深度分析内容（300字以上，结构清晰）",\n'
+                f'  "analysis": "深度分析内容（200~500字，结构清晰）",\n'
                 f'  "key_points": ["要点1", "要点2", "要点3"],\n'
                 f'  "sources": ["来源URL或摘要1", "来源URL或摘要2"],\n'
                 f'  "difficulty": "初级/中级/高级"\n'
@@ -1070,10 +1238,12 @@ class KnowledgeBaseBuilder:
             record: dict[str, Any]
 
             try:
+                self._log(f"阶段3-分析：问题 {q_id} 开始生成结构化答案", "INFO")
                 analysis_response = self._call_api(
                     system_prompt=analysis_system_prompt,
                     user_prompt=analysis_user_prompt,
                     enable_json_mode=True,
+                    max_tokens=MAX_TOKENS_ANALYSIS,
                 )
                 content = self._extract_message_content(analysis_response, default="{}")
                 parsed = self._safe_parse_json(content)
@@ -1133,6 +1303,9 @@ class KnowledgeBaseBuilder:
         """
         执行完整的知识库构建流程
         """
+        before_balance = self._fetch_balance()
+        self._print_balance_snapshot("执行前余额", before_balance)
+
         print("\n" + "=" * 60)
         print("🚀 Kimi API 知识库构建脚本启动")
         print("=" * 60)
@@ -1205,6 +1378,10 @@ class KnowledgeBaseBuilder:
             sys.exit(1)
 
         finally:
+            after_balance = self._fetch_balance()
+            self._print_balance_snapshot("执行后余额", after_balance)
+            self._print_balance_delta(before_balance, after_balance)
+
             # 确保文件正确关闭
             self.output_file.flush()
             os.fsync(self.output_file.fileno())
