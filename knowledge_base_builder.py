@@ -68,13 +68,14 @@ FLUSH_INTERVAL = 10  # 每 N 条记录强制刷新磁盘
 COST_REPORT_INTERVAL = 20  # 每 N 个问题报告一次累计消耗
 MAX_WEB_SEARCH_TOOL_ROUNDS = 6  # 联网搜索工具调用的最大回合数（防止死循环）
 STREAM_LOG_CHUNK_INTERVAL = 20  # 流式输出每 N 个 chunk 打印一次进度日志
-DISABLE_THINKING_BY_DEFAULT = True  # 默认禁用 thinking，避免长时间仅输出 reasoning_content
-MAX_TOKENS_RESEARCH = 1800  # 阶段1调研输出上限
-MAX_TOKENS_GENERATE_QUESTIONS = 3200  # 阶段2问题清单输出上限
-MAX_TOKENS_SEARCH = 1200  # 阶段3搜索摘要输出上限
-MAX_TOKENS_ANALYSIS = 1600  # 阶段3结构化分析输出上限
-MAX_RESEARCH_SUMMARY_PROMPT_CHARS = 3000  # 注入提示词的调研摘要最大字符数
-MAX_SEARCH_RESULT_PROMPT_CHARS = 2500  # 注入提示词的搜索结果最大字符数
+THINKING_TYPE_WITH_WEB_SEARCH = "disabled"  # 联网场景禁用 thinking（阶段1与阶段3搜索）
+THINKING_TYPE_WITHOUT_WEB_SEARCH = "enabled"  # 非联网场景启用 thinking（阶段2与阶段3分析）
+MAX_TOKENS_RESEARCH = 10000  # 阶段1调研输出上限（放大10倍）
+MAX_TOKENS_GENERATE_QUESTIONS = 20000  # 阶段2问题清单输出上限（放大10倍）
+MAX_TOKENS_SEARCH = 20000  # 阶段3搜索摘要输出上限（放大10倍）
+MAX_TOKENS_ANALYSIS = 50000  # 阶段3结构化分析输出上限（放大10倍）
+MAX_RESEARCH_SUMMARY_PROMPT_CHARS = 5000  # 注入提示词的调研摘要最大字符数（放大10倍）
+MAX_SEARCH_RESULT_PROMPT_CHARS = 10000  # 注入提示词的搜索结果最大字符数（放大10倍）
 
 # Token 消耗估算参数（用于成本预估）
 AVG_INPUT_TOKENS_PER_QUESTION = 800  # 每个问题平均输入 token
@@ -618,11 +619,16 @@ class KnowledgeBaseBuilder:
         if enable_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
-        if DISABLE_THINKING_BY_DEFAULT:
-            # 对所有请求默认禁用 thinking，减少“长时间只产生 reasoning_content”导致的卡住感
-            extra_body = cast(dict[str, Any], kwargs.get("extra_body", {}))
-            extra_body["thinking"] = {"type": "disabled"}
-            kwargs["extra_body"] = extra_body
+        # Kimi K2.6：通过 extra_body.thinking 控制思考模式
+        # 规则：联网搜索时禁用 thinking；非联网时启用 thinking。
+        thinking_type = (
+            THINKING_TYPE_WITH_WEB_SEARCH
+            if enable_web_search
+            else THINKING_TYPE_WITHOUT_WEB_SEARCH
+        )
+        extra_body = cast(dict[str, Any], kwargs.get("extra_body", {}))
+        extra_body["thinking"] = {"type": thinking_type}
+        kwargs["extra_body"] = extra_body
 
         if enable_web_search:
             kwargs["tools"] = [
@@ -1049,7 +1055,7 @@ class KnowledgeBaseBuilder:
                 f"1. 问题应覆盖该主题在 {level_cn} 阶段必须掌握的核心知识点\n"
                 f"2. 问题应具体、明确，便于后续逐一深度分析\n"
                 f"3. 问题难度应符合 {level_cn} 水平\n"
-                f"4. 每个问题尽量简洁，建议控制在 10~30 个汉字内\n"
+                f"4. 每个问题尽量简洁，表述清晰且便于后续逐题分析\n"
                 f"5. 只输出 JSON，不要有任何其他文字\n\n"
                 f"输出格式（严格遵守）：\n"
                 f'{{"level":"{level_en}","topic":"{self.topic}","questions":["问题1","问题2",...]}}'
@@ -1181,9 +1187,10 @@ class KnowledgeBaseBuilder:
             search_prompt = (
                 f"请搜索网页，搜索以下问题的相关资料和权威解释：\n"
                 f"主题：{self.topic}\n"
+                f"阶段1调研摘要：{self.research_summary[:MAX_SEARCH_RESULT_PROMPT_CHARS]}\n"
                 f"问题：{question_text}\n\n"
                 f"请基于搜索结果，输出一份精简摘要，要求：\n"
-                f"1. 总长度控制在 300~600 字内\n"
+                f"1. 内容完整、结构清晰，优先保留直接回答该问题所需的信息\n"
                 f"2. 只保留与该问题直接相关的信息\n"
                 f"3. 优先给出定义、关键结论、核心事实、最多 5 条要点\n"
                 f"4. 不要展开泛泛而谈，不要输出无关背景。"
@@ -1219,7 +1226,7 @@ class KnowledgeBaseBuilder:
                 f"级别：{level}\n\n"
                 f"搜索结果参考：\n{self._truncate_for_prompt(search_result_text, MAX_SEARCH_RESULT_PROMPT_CHARS)}\n\n"
                 f"输出要求：\n"
-                f"1. analysis 字段控制在 200~500 字\n"
+                f"1. analysis 字段要求结构清晰、论证充分\n"
                 f"2. key_points 最多 5 条\n"
                 f"3. sources 最多 3 条\n"
                 f"4. 只保留与当前问题最直接相关的信息\n\n"
