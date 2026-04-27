@@ -65,6 +65,7 @@ FLUSH_INTERVAL = 10  # 每 N 条记录强制刷新磁盘
 COST_REPORT_INTERVAL = 20  # 每 N 个问题报告一次累计消耗
 MAX_WEB_SEARCH_TOOL_ROUNDS = 6  # 联网搜索工具调用的最大回合数（防止死循环）
 STREAM_LOG_CHUNK_INTERVAL = 20  # 流式输出每 N 个 chunk 打印一次进度日志
+DISABLE_THINKING_BY_DEFAULT = True  # 默认禁用 thinking，避免长时间仅输出 reasoning_content
 
 # Token 消耗估算参数（用于成本预估）
 AVG_INPUT_TOKENS_PER_QUESTION = 800  # 每个问题平均输入 token
@@ -212,6 +213,7 @@ class KnowledgeBaseBuilder:
         stream = cast(Any, self.client.chat.completions.create(**kwargs))
 
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         finish_reason: str | None = None
         role = "assistant"
         usage_dict: dict[str, Any] | None = None
@@ -226,7 +228,11 @@ class KnowledgeBaseBuilder:
                 self._log("已收到首个 chunk，开始持续输出。", "INFO")
             elif chunk_count % STREAM_LOG_CHUNK_INTERVAL == 0:
                 self._log(
-                    f"流式进度：已接收 {chunk_count} 个 chunks，累计文本长度 {sum(len(x) for x in content_parts)} 字符",
+                    (
+                        f"流式进度：已接收 {chunk_count} 个 chunks，"
+                        f"content累计 {sum(len(x) for x in content_parts)} 字符，"
+                        f"reasoning累计 {sum(len(x) for x in reasoning_parts)} 字符"
+                    ),
                     "DEBUG",
                 )
 
@@ -249,6 +255,10 @@ class KnowledgeBaseBuilder:
             if isinstance(delta_content, str) and delta_content:
                 content_parts.append(delta_content)
 
+            delta_reasoning = delta.get("reasoning_content")
+            if isinstance(delta_reasoning, str) and delta_reasoning:
+                reasoning_parts.append(delta_reasoning)
+
             delta_tool_calls = delta.get("tool_calls")
             if isinstance(delta_tool_calls, list):
                 for tc_dict in cast(list[dict[str, Any]], delta_tool_calls):
@@ -265,8 +275,11 @@ class KnowledgeBaseBuilder:
 
                     if "id" in tc_dict:
                         acc["id"] = tc_dict["id"]
-                    if "type" in tc_dict:
-                        acc["type"] = tc_dict["type"]
+
+                    # 注意：Kimi 内置工具在流式分片中 type 可能为 builtin_function，
+                    # 但 ChatCompletionMessageToolCall 的标准类型是 function。
+                    # 为保证聚合后的 ChatCompletion 可被 Pydantic 正确校验，这里固定为 function。
+                    acc["type"] = "function"
 
                     fn_raw = tc_dict.get("function", {})
                     fn: dict[str, Any] = cast(dict[str, Any], fn_raw) if isinstance(fn_raw, dict) else {}
@@ -288,7 +301,11 @@ class KnowledgeBaseBuilder:
                 usage_dict = cast(dict[str, Any], choice_usage_candidate)
 
         self._log(
-            f"流式请求完成：chunks={chunk_count}, finish_reason={finish_reason}, content_len={sum(len(x) for x in content_parts)}",
+            (
+                f"流式请求完成：chunks={chunk_count}, finish_reason={finish_reason}, "
+                f"content_len={sum(len(x) for x in content_parts)}, "
+                f"reasoning_len={sum(len(x) for x in reasoning_parts)}"
+            ),
             "INFO",
         )
 
@@ -339,6 +356,12 @@ class KnowledgeBaseBuilder:
         if enable_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
+        if DISABLE_THINKING_BY_DEFAULT:
+            # 对所有请求默认禁用 thinking，减少“长时间只产生 reasoning_content”导致的卡住感
+            extra_body = cast(dict[str, Any], kwargs.get("extra_body", {}))
+            extra_body["thinking"] = {"type": "disabled"}
+            kwargs["extra_body"] = extra_body
+
         if enable_web_search:
             kwargs["tools"] = [
                 {
@@ -346,7 +369,6 @@ class KnowledgeBaseBuilder:
                     "function": {"name": "$web_search"},
                 }
             ]
-            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
         mode = "stream" if self.enable_stream else "non-stream"
         self._log(
