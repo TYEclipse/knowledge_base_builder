@@ -36,6 +36,7 @@ Kimi API 知识库构建脚本
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -128,6 +129,7 @@ class KnowledgeBaseBuilder:
         topic: str,
         audience: str = DEFAULT_AUDIENCE,
         output_path: str = DEFAULT_OUTPUT,
+        markdown_output_path: Optional[str] = None,
         resume_from: int = 0,
         max_questions: int = DEFAULT_MAX_QUESTIONS,
         enable_stream: bool = True,
@@ -140,6 +142,7 @@ class KnowledgeBaseBuilder:
             topic: 知识库主题（必填）
             audience: 目标受众（beginner/intermediate/advanced）
             output_path: 输出文件路径
+            markdown_output_path: Markdown 输出路径（为空时根据 output_path 自动推导）
             resume_from: 断点续传起始序号（0 表示从头开始）
             max_questions: 最大问题数限制
             enable_stream: 是否启用流式输出
@@ -148,6 +151,7 @@ class KnowledgeBaseBuilder:
         self.topic = topic
         self.audience = audience
         self.output_path = output_path
+        self.markdown_output_dir = self._normalize_markdown_output_dir(markdown_output_path, output_path)
         self.resume_from = resume_from
         self.max_questions = max_questions
         self.enable_stream = enable_stream
@@ -187,8 +191,124 @@ class KnowledgeBaseBuilder:
         self.output_file = open(self.output_path, "a", encoding="utf-8")
         print(f"[初始化] 输出文件已打开：{os.path.abspath(self.output_path)}")
 
+        # 初始化 Markdown 多文件目录结构
+        os.makedirs(self.markdown_output_dir, exist_ok=True)
+        self.summary_markdown_path = os.path.join(self.markdown_output_dir, "01_research_summary.md")
+        self.question_list_markdown_paths = {
+            "beginner": os.path.join(self.markdown_output_dir, "02_beginner_questions.md"),
+            "intermediate": os.path.join(self.markdown_output_dir, "03_intermediate_questions.md"),
+            "advanced": os.path.join(self.markdown_output_dir, "04_advanced_questions.md"),
+        }
+        self.answers_markdown_dir = os.path.join(self.markdown_output_dir, "answers")
+        os.makedirs(self.answers_markdown_dir, exist_ok=True)
+        print(f"[初始化] Markdown 输出目录已准备：{os.path.abspath(self.markdown_output_dir)}")
+
+        self.resume_markdown_append = self.resume_from > 0 and os.path.exists(self.markdown_output_dir)
+
         # 阶段 2 生成的问题清单缓存
         self.all_questions: list[dict[str, Any]] = []
+
+        # 调研摘要缓存，便于后续阶段提示词复用
+        self.research_summary = ""
+
+    @staticmethod
+    def _derive_markdown_output_dir(output_path: str) -> str:
+        """根据 JSONL 输出路径推导 Markdown 输出目录。"""
+        stem, ext = os.path.splitext(output_path)
+        return f"{stem}_markdown" if ext else f"{output_path}_markdown"
+
+    @classmethod
+    def _normalize_markdown_output_dir(cls, markdown_output_path: Optional[str], output_path: str) -> str:
+        """将用户传入的 markdown 路径标准化为输出目录。"""
+        if not markdown_output_path:
+            return cls._derive_markdown_output_dir(output_path)
+
+        path = markdown_output_path
+        _, ext = os.path.splitext(path)
+        if ext.lower() == ".md":
+            return os.path.splitext(path)[0] + "_files"
+        return path
+
+    @staticmethod
+    def _sanitize_filename(text: str, max_length: int = 60) -> str:
+        """将题目文本转为适合文件名的简短 slug。"""
+        cleaned = re.sub(r'[<>:"/\\|?*\r\n\t]+', '_', text).strip()
+        cleaned = re.sub(r'\s+', '_', cleaned)
+        cleaned = re.sub(r'_+', '_', cleaned)
+        cleaned = cleaned.strip('._')
+        if not cleaned:
+            return "question"
+        return cleaned[:max_length]
+
+    @staticmethod
+    def _write_text_file(path: str, text: str, mode: str = "w") -> None:
+        """写入单个文本文件。"""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, mode, encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _build_markdown_meta_block(self) -> str:
+        """生成统一的 Markdown 元信息块。"""
+        return (
+            f"# 知识库：{self.topic}\n\n"
+            f"- 受众：`{self.audience}`\n"
+            f"- 生成时间：`{datetime.now().isoformat()}`\n"
+            f"- JSONL 输出：`{os.path.abspath(self.output_path)}`\n\n"
+        )
+
+    def _write_markdown_research(self, summary: str) -> None:
+        """写入阶段 1 调研摘要。"""
+        content = (
+            f"{self._build_markdown_meta_block()}"
+            "## 1. 主题调研摘要\n\n"
+            f"{summary}\n\n"
+        )
+        self._write_text_file(self.summary_markdown_path, content)
+
+    def _write_markdown_question_list(self, level_cn: str, level_en: str, questions: list[str]) -> None:
+        """写入阶段 2 问题清单。"""
+        target_path = self.question_list_markdown_paths.get(level_en, os.path.join(self.markdown_output_dir, f"questions_{level_en}.md"))
+        lines = [
+            f"{self._build_markdown_meta_block()}"
+            f"## 2.{level_en} 问题清单（{level_cn}）\n\n"
+        ]
+        for idx, question in enumerate(questions, start=1):
+            lines.append(f"{idx}. {question}\n")
+        self._write_text_file(target_path, "".join(lines))
+
+    def _write_markdown_analysis(self, record: dict[str, Any]) -> None:
+        """写入阶段 3 的单题分析。"""
+        key_points = record.get("key_points", [])
+        sources = record.get("sources", [])
+        question_slug = self._sanitize_filename(str(record["question"]))
+        answer_path = os.path.join(self.answers_markdown_dir, f"{int(record['id']):04d}_{question_slug}.md")
+
+        lines = [
+            f"{self._build_markdown_meta_block()}"
+            f"## 3.{record['id']} {record['question']}\n\n",
+            f"- 级别：`{record['level']}`\n",
+            f"- 难度：`{record.get('difficulty', record['level'])}`\n\n",
+            "### 分析\n\n",
+            f"{record['analysis']}\n\n",
+            "### 要点\n\n",
+        ]
+
+        if isinstance(key_points, list) and key_points:
+            for item in cast(list[Any], key_points):
+                lines.append(f"- {item}\n")
+        else:
+            lines.append("- 无\n")
+
+        lines.append("\n### 来源\n\n")
+        if isinstance(sources, list) and sources:
+            for item in cast(list[Any], sources):
+                lines.append(f"- {item}\n")
+        else:
+            lines.append("- 无\n")
+
+        self._write_text_file(answer_path, "".join(lines))
 
     def _log(self, message: str, level: str = "INFO") -> None:
         """
@@ -708,6 +828,8 @@ class KnowledgeBaseBuilder:
                 "summary": content,
             }
             self._write_jsonl(research_record, flush=True)
+            if not self.resume_markdown_append:
+                self._write_markdown_research(content)
             return research_record
 
         except Exception as e:
@@ -810,6 +932,8 @@ class KnowledgeBaseBuilder:
                     "questions": questions,
                 }
                 self._write_jsonl(phase2_record)
+                if not self.resume_markdown_append:
+                    self._write_markdown_question_list(level_cn, level_en, questions)
 
                 # 将问题加入主清单
                 for q in questions:
@@ -927,6 +1051,7 @@ class KnowledgeBaseBuilder:
             analysis_user_prompt = (
                 f"请深度分析以下问题，并严格按照 JSON 格式输出：\n\n"
                 f"主题：{self.topic}\n"
+                f"阶段1调研摘要：\n{self.research_summary}\n\n"
                 f"问题：{question_text}\n"
                 f"级别：{level}\n\n"
                 f"搜索结果参考：\n{search_result_text}\n\n"
@@ -988,6 +1113,7 @@ class KnowledgeBaseBuilder:
             # 写入结果（每 FLUSH_INTERVAL 条强制刷新）
             flush = idx % FLUSH_INTERVAL == 0
             self._write_jsonl(record, flush=flush)
+            self._write_markdown_analysis(record)
 
             # 更新进度条
             pbar.update(1)
@@ -1013,6 +1139,7 @@ class KnowledgeBaseBuilder:
         print(f"主题：{self.topic}")
         print(f"受众：{self.audience}")
         print(f"输出：{os.path.abspath(self.output_path)}")
+        print(f"Markdown目录：{os.path.abspath(self.markdown_output_dir)}")
         print(f"断点续传：从第 {self.resume_from} 个问题开始")
         print(f"最大问题数：{self.max_questions}")
         print(f"流式输出：{self.enable_stream}")
@@ -1022,6 +1149,7 @@ class KnowledgeBaseBuilder:
         try:
             # 阶段 1：主题调研
             research_result = self.phase1_research()
+            self.research_summary = str(research_result.get("summary", ""))
 
             # 阶段 2：生成问题清单
             # 如果 resume_from > 0，尝试从已有输出文件恢复问题清单（避免重复生成）
@@ -1160,6 +1288,12 @@ def main() -> None:
         help=f"输出文件路径（默认：{DEFAULT_OUTPUT}）",
     )
     parser.add_argument(
+        "--markdown-output",
+        type=str,
+        default=None,
+        help="Markdown 输出文件路径（默认：根据 --output 自动推导 .md 路径）",
+    )
+    parser.add_argument(
         "--resume",
         type=int,
         default=0,
@@ -1200,6 +1334,7 @@ def main() -> None:
         topic=args.topic,
         audience=args.audience,
         output_path=args.output,
+        markdown_output_path=args.markdown_output,
         resume_from=args.resume,
         max_questions=args.max_questions,
         enable_stream=args.stream,
