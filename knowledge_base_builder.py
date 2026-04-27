@@ -1,0 +1,933 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+Kimi API 知识库构建脚本
+================================================================================
+功能：基于 Kimi API (kimi-k2.6) 自动生成结构化知识库（JSON Lines 格式）
+流程：主题调研 → 三级问题清单生成 → 逐个问题深度分析
+作者：AI Agent (Kimi)
+依赖：pip install openai tenacity tqdm
+
+【Kimi API 关键配置】
+- 模型名称：kimi-k2.6
+- Base URL：https://api.moonshot.ai/v1
+- JSON Mode：response_format={"type": "json_object"}
+- 联网搜索：builtin_function.$web_search（需配合 thinking={"type":"disabled"}）
+- SDK：OpenAI Python SDK 兼容（pip install openai）
+- API Key：通过环境变量 MOONSHOT_API_KEY 读取
+
+【使用示例】
+1. 基础用法（默认初学者级别，300个问题）：
+   export MOONSHOT_API_KEY="your-api-key"
+   python knowledge_base_builder.py --topic "量子计算"
+
+2. 指定受众和输出路径：
+   python knowledge_base_builder.py --topic "React 18" --audience intermediate --output ./react_kb.jsonl
+
+3. 断点续传（从第 50 个问题继续）：
+   python knowledge_base_builder.py --topic "Docker" --resume 50
+
+4. 快速测试（仅生成 10 个问题）：
+   python knowledge_base_builder.py --topic "Kubernetes" --max-questions 10
+================================================================================
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from typing import Any, Optional, cast
+
+import openai
+from openai import OpenAI
+from openai.types.chat.chat_completion import ChatCompletion
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+from tqdm import tqdm
+
+# ==============================================================================
+# 全局常量配置
+# ==============================================================================
+MODEL_NAME = "kimi-k2.6"  # Kimi API 模型名称
+BASE_URL = "https://api.moonshot.ai/v1"  # Kimi API Base URL
+DEFAULT_MAX_QUESTIONS = 300  # 默认最大问题数（初级100+中级100+高级100）
+DEFAULT_AUDIENCE = "beginner"  # 默认目标受众
+DEFAULT_OUTPUT = "./knowledge_base.jsonl"  # 默认输出文件路径
+QUESTIONS_PER_LEVEL = 100  # 每个级别生成的问题数量
+FLUSH_INTERVAL = 10  # 每 N 条记录强制刷新磁盘
+COST_REPORT_INTERVAL = 20  # 每 N 个问题报告一次累计消耗
+
+# Token 消耗估算参数（用于成本预估）
+AVG_INPUT_TOKENS_PER_QUESTION = 800  # 每个问题平均输入 token
+AVG_OUTPUT_TOKENS_PER_QUESTION = 600  # 每个问题平均输出 token
+AVG_INPUT_TOKENS_RESEARCH = 500  # 调研阶段平均输入 token
+AVG_OUTPUT_TOKENS_RESEARCH = 800  # 调研阶段平均输出 token
+AVG_INPUT_TOKENS_GENERATE = 400  # 问题生成阶段平均输入 token
+AVG_OUTPUT_TOKENS_GENERATE = 1200  # 问题生成阶段平均输出 token
+
+
+class KnowledgeBaseBuilder:
+    """
+    知识库构建器（面向对象封装）
+
+    核心职责：
+    1. 初始化 OpenAI 客户端（Kimi API 兼容模式）
+    2. 执行三阶段构建流程：调研 → 生成问题 → 深度分析
+    3. 管理输出文件、断点续传、进度追踪
+    4. 实现指数退避重试、JSON 容错解析
+    """
+
+    @staticmethod
+    def _load_env_file(env_path: str) -> None:
+        """
+        从 .env 文件加载环境变量（仅在系统环境变量不存在时设置）
+
+        Args:
+            env_path: .env 文件路径
+        """
+        if not os.path.exists(env_path):
+            return
+
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        except Exception as e:
+            print(f"[警告] 读取 .env 文件失败（{env_path}）：{e}")
+
+    def __init__(
+        self,
+        topic: str,
+        audience: str = DEFAULT_AUDIENCE,
+        output_path: str = DEFAULT_OUTPUT,
+        resume_from: int = 0,
+        max_questions: int = DEFAULT_MAX_QUESTIONS,
+    ):
+        """
+        初始化构建器
+
+        Args:
+            topic: 知识库主题（必填）
+            audience: 目标受众（beginner/intermediate/advanced）
+            output_path: 输出文件路径
+            resume_from: 断点续传起始序号（0 表示从头开始）
+            max_questions: 最大问题数限制
+        """
+        self.topic = topic
+        self.audience = audience
+        self.output_path = output_path
+        self.resume_from = resume_from
+        self.max_questions = max_questions
+
+        # 统计计数器
+        self.total_api_calls = 0  # API 总调用次数
+        self.total_input_tokens = 0  # 累计输入 token
+        self.total_output_tokens = 0  # 累计输出 token
+        self.start_time = time.time()  # 起始时间戳
+
+        # 先尝试从脚本目录和当前工作目录读取 .env
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self._load_env_file(os.path.join(script_dir, ".env"))
+        if os.getcwd() != script_dir:
+            self._load_env_file(os.path.join(os.getcwd(), ".env"))
+
+        # 初始化 OpenAI 客户端（Kimi API 兼容模式）
+        api_key = os.environ.get("MOONSHOT_API_KEY")
+        if not api_key:
+            print(
+                "[错误] 未找到环境变量 MOONSHOT_API_KEY。\n"
+                "请在项目根目录创建 .env 并写入：MOONSHOT_API_KEY=your-key\n"
+                "Linux/macOS: export MOONSHOT_API_KEY='your-key'\n"
+                "PowerShell: $env:MOONSHOT_API_KEY='your-key'"
+            )
+            sys.exit(1)
+
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=BASE_URL,
+        )
+
+        # 初始化输出文件（追加模式，支持断点续传）
+        self.output_file = open(self.output_path, "a", encoding="utf-8")
+        print(f"[初始化] 输出文件已打开：{os.path.abspath(self.output_path)}")
+
+        # 阶段 2 生成的问题清单缓存
+        self.all_questions: list[dict[str, Any]] = []
+
+        # 是否已经打印过 thinking 参数兼容提示（避免重复刷屏）
+        self._thinking_compat_warned = False
+
+    # ==========================================================================
+    # 底层 API 调用方法（带指数退避重试）
+    # ==========================================================================
+
+    @retry(
+        retry=retry_if_exception_type(
+            (openai.APIError, openai.APITimeoutError, openai.APIConnectionError)
+        ),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        reraise=True,
+    )
+    def _call_api(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        enable_json_mode: bool = False,
+        enable_web_search: bool = False,
+    ) -> ChatCompletion:
+        """
+        底层 API 调用封装（带 tenacity 指数退避重试）
+
+        Args:
+            system_prompt: 系统提示词
+            user_prompt: 用户提示词
+            enable_json_mode: 是否启用 JSON Mode
+            enable_web_search: 是否启用联网搜索
+
+        Returns:
+            OpenAI API 返回的完整 response 对象（字典形式）
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        # 构建请求参数
+        kwargs: dict[str, Any] = {
+            "model": MODEL_NAME,
+            "messages": messages,
+        }
+
+        # 启用 JSON Mode（强制模型输出合法 JSON）
+        if enable_json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        # 启用联网搜索（必须关闭 thinking）
+        if enable_web_search:
+            kwargs["tools"] = [
+                {
+                    "type": "builtin_function",
+                    "function": {"name": "$web_search"},
+                }
+            ]
+            kwargs["thinking"] = {"type": "disabled"}
+
+        # 执行 API 调用
+        try:
+            response = cast(ChatCompletion, self.client.chat.completions.create(**kwargs))
+        except TypeError as e:
+            # 部分 API 兼容层不支持 thinking 参数，自动降级重试
+            if enable_web_search and "unexpected keyword argument 'thinking'" in str(e):
+                kwargs.pop("thinking", None)
+                if not self._thinking_compat_warned:
+                    print("[提示] 当前接口不支持 thinking 参数，已自动降级为不传 thinking。")
+                    self._thinking_compat_warned = True
+                response = cast(ChatCompletion, self.client.chat.completions.create(**kwargs))
+            else:
+                raise
+
+        self.total_api_calls += 1
+
+        # 统计 token 消耗（如果有 usage 字段）
+        usage = response.usage
+        if usage:
+            self.total_input_tokens += usage.prompt_tokens
+            self.total_output_tokens += usage.completion_tokens
+
+        return response
+
+    @staticmethod
+    def _is_auth_error(error: Exception) -> bool:
+        """
+        判断异常是否为鉴权错误（API Key 无效/失效）
+        """
+        if isinstance(error, openai.AuthenticationError):
+            return True
+
+        message = str(error).lower()
+        return "invalid authentication" in message or "invalid_authentication_error" in message
+
+    def _raise_if_auth_error(self, error: Exception) -> None:
+        """
+        若为鉴权错误则立即抛出致命异常，避免继续写入大量降级数据
+        """
+        if self._is_auth_error(error):
+            raise RuntimeError(
+                "MOONSHOT_API_KEY 鉴权失败（401 Invalid Authentication）。"
+                "请检查 Key 是否正确、是否过期、是否与当前 Base URL 匹配。"
+            ) from error
+
+    @staticmethod
+    def _extract_message_content(response: ChatCompletion, default: str = "") -> str:
+        """
+        从 ChatCompletion 中安全提取首条消息文本
+
+        Args:
+            response: OpenAI ChatCompletion 响应对象
+            default: 提取失败时的默认文本
+
+        Returns:
+            首条消息内容字符串
+        """
+        if not response.choices:
+            return default
+
+        content = response.choices[0].message.content
+        return content if isinstance(content, str) else default
+
+    def _safe_parse_json(self, text: str, max_retries: int = 2) -> dict[str, Any]:
+        """
+        安全解析 JSON（带容错和重试）
+
+        Args:
+            text: 待解析的 JSON 字符串
+            max_retries: JSON 解析失败后的最大重试次数
+
+        Returns:
+            解析后的 Python 字典
+
+        Raises:
+            json.JSONDecodeError: 当所有重试均失败时抛出
+        """
+        # 首先尝试直接解析
+        for attempt in range(max_retries + 1):
+            try:
+                cleaned = text.strip()
+                # 去除可能的 markdown 代码块标记
+                if cleaned.startswith("```json"):
+                    cleaned = cleaned[7:]
+                if cleaned.startswith("```"):
+                    cleaned = cleaned[3:]
+                if cleaned.endswith("```"):
+                    cleaned = cleaned[:-3]
+                cleaned = cleaned.strip()
+                return json.loads(cleaned)
+            except json.JSONDecodeError as e:
+                if attempt == max_retries:
+                    raise e
+                # 重试前等待
+                time.sleep(2**attempt)
+
+        # 理论上不会到达此处，但为了类型安全
+        raise json.JSONDecodeError("JSON 解析失败，已耗尽重试次数", text, 0)
+
+    def _write_jsonl(self, record: dict[str, Any], flush: bool = False) -> None:
+        """
+        将单条记录写入 JSON Lines 文件
+
+        Args:
+            record: 要写入的字典对象
+            flush: 是否立即强制刷新到磁盘
+        """
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        self.output_file.write(line + "\n")
+        if flush:
+            self.output_file.flush()
+            os.fsync(self.output_file.fileno())
+
+    def _print_cost_estimate(self, num_questions: int) -> None:
+        """
+        打印预估 token 消耗和成本
+
+        Args:
+            num_questions: 计划处理的问题总数
+        """
+        # 阶段 1：调研
+        research_input = AVG_INPUT_TOKENS_RESEARCH
+        research_output = AVG_OUTPUT_TOKENS_RESEARCH
+
+        # 阶段 2：问题生成（3 个级别，每个级别 1 次调用）
+        generate_calls = 3
+        generate_input = AVG_INPUT_TOKENS_GENERATE * generate_calls
+        generate_output = AVG_OUTPUT_TOKENS_GENERATE * generate_calls
+
+        # 阶段 3：逐个分析问题
+        analyze_input = AVG_INPUT_TOKENS_PER_QUESTION * num_questions
+        analyze_output = AVG_OUTPUT_TOKENS_PER_QUESTION * num_questions
+
+        total_input = research_input + generate_input + analyze_input
+        total_output = research_output + generate_output + analyze_output
+        total_tokens = total_input + total_output
+
+        print("\n" + "=" * 60)
+        print("📊 Token 消耗预估（仅供参考）")
+        print("=" * 60)
+        print(
+            f"阶段 1 调研：        输入 ≈ {research_input:,}  | 输出 ≈ {research_output:,}"
+        )
+        print(
+            f"阶段 2 问题生成：    输入 ≈ {generate_input:,}  | 输出 ≈ {generate_output:,}"
+        )
+        print(
+            f"阶段 3 深度分析：    输入 ≈ {analyze_input:,}  | 输出 ≈ {analyze_output:,}"
+        )
+        print("-" * 60)
+        print(
+            f"总计预估 Token：     {total_tokens:,}（输入 {total_input:,} + 输出 {total_output:,}）"
+        )
+        print(f"API 预估调用次数：   {1 + generate_calls + num_questions}")
+        print("=" * 60 + "\n")
+
+    def _print_progress_report(self, completed: int) -> None:
+        """
+        打印阶段性进度和累计消耗报告
+
+        Args:
+            completed: 已完成的问题数量
+        """
+        elapsed = time.time() - self.start_time
+        print("\n" + "-" * 60)
+        print(f"⏱️  已运行时间：{elapsed:.1f} 秒")
+        print(f"✅ 已完成问题：{completed} / {self.max_questions}")
+        print(f"📡 API 调用次数：{self.total_api_calls}")
+        print(f"📝 累计输入 Token：{self.total_input_tokens:,}")
+        print(f"📝 累计输出 Token：{self.total_output_tokens:,}")
+        print("-" * 60 + "\n")
+
+    # ==========================================================================
+    # 阶段 1：主题调研（联网搜索）
+    # ==========================================================================
+
+    def phase1_research(self) -> dict[str, Any]:
+        """
+        阶段 1：对主题进行联网搜索调研
+
+        Returns:
+            调研结果字典，包含 summary 和 raw_response
+        """
+        print(f"\n{'='*60}")
+        print(f"🔍 阶段 1：主题调研 —— {self.topic}")
+        print(f"{'='*60}")
+
+        system_prompt = (
+            f"你是 {self.topic} 领域的资深技术专家。"
+            "请基于搜索结果，用中文输出该主题的结构化调研摘要。"
+        )
+        user_prompt = (
+            f"请搜索网络，调研 '{self.topic}' 主题的以下内容：\n"
+            f"1. 核心定义与基本概念\n"
+            f"2. 主要技术分支与组成部分\n"
+            f"3. 学习路径与关键里程碑\n"
+            f"4. 当前行业应用场景\n"
+            f"5. 与相关技术的关系\n\n"
+            f"请以结构化的方式输出调研摘要，便于后续生成教学问题清单。"
+        )
+
+        try:
+            response = self._call_api(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                enable_web_search=True,
+            )
+            content = self._extract_message_content(response)
+            print("[阶段 1] 调研完成，摘要长度：{} 字符".format(len(content)))
+
+            research_record: dict[str, Any] = {
+                "phase": 1,
+                "type": "research",
+                "topic": self.topic,
+                "timestamp": datetime.now().isoformat(),
+                "summary": content,
+            }
+            self._write_jsonl(research_record, flush=True)
+            return research_record
+
+        except Exception as e:
+            self._raise_if_auth_error(e)
+            print(f"[错误] 阶段 1 调研失败：{e}")
+            # 即使调研失败，也记录错误并继续，使用降级内容
+            fallback_record: dict[str, Any] = {
+                "phase": 1,
+                "type": "research",
+                "topic": self.topic,
+                "timestamp": datetime.now().isoformat(),
+                "summary": f"调研失败（错误：{e}），将使用主题默认值继续生成问题。",
+                "error": str(e),
+            }
+            self._write_jsonl(fallback_record, flush=True)
+            return fallback_record
+
+    # ==========================================================================
+    # 阶段 2：三级问题清单生成（JSON Mode）
+    # ==========================================================================
+
+    def phase2_generate_questions(self, research_summary: str) -> list[dict[str, Any]]:
+        """
+        阶段 2：生成三级问题清单（初级/中级/高级各 100 问）
+
+        Args:
+            research_summary: 阶段 1 的调研摘要文本
+
+        Returns:
+            合并后的全部问题列表，每个问题包含 id, level, question 字段
+        """
+        print(f"\n{'='*60}")
+        print(f"📝 阶段 2：生成三级问题清单")
+        print(f"{'='*60}")
+
+        levels = [
+            ("beginner", "初学者"),
+            ("intermediate", "中级学习者"),
+            ("advanced", "高级学习者"),
+        ]
+
+        all_questions: list[dict[str, Any]] = []
+        question_id = 0
+
+        for level_en, level_cn in levels:
+            print(
+                f"\n[阶段 2] 正在生成 {level_cn} 级别（{level_en}）的 {QUESTIONS_PER_LEVEL} 个问题..."
+            )
+
+            system_prompt = (
+                f"你是 {self.topic} 领域的专家。"
+                f"请列出 {self.topic} 的 {level_cn} 100 个问题清单。"
+                f"只输出 JSON，不要回答任何问题，不要添加额外解释。"
+            )
+
+            user_prompt = (
+                f"基于以下调研摘要，生成 {self.topic} 的 {level_cn}（{level_en}）100 个问题清单。\n\n"
+                f"调研摘要：\n{research_summary}\n\n"
+                f"要求：\n"
+                f"1. 问题应覆盖该主题在 {level_cn} 阶段必须掌握的核心知识点\n"
+                f"2. 问题应具体、明确，便于后续逐一深度分析\n"
+                f"3. 问题难度应符合 {level_cn} 水平\n"
+                f"4. 只输出 JSON，不要有任何其他文字\n\n"
+                f"输出格式（严格遵守）：\n"
+                f'{{"level":"{level_en}","topic":"{self.topic}","questions":["问题1","问题2",...]}}'
+            )
+
+            try:
+                response = self._call_api(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    enable_json_mode=True,
+                )
+                content = self._extract_message_content(response, default="{}")
+                parsed = self._safe_parse_json(content)
+
+                questions = parsed.get("questions", [])
+                level_label = parsed.get("level", level_en)
+                topic_label = parsed.get("topic", self.topic)
+
+                print(f"[阶段 2] {level_cn} 级别生成完成，获得 {len(questions)} 个问题")
+
+                # 如果生成的问题数不足 100，补充占位问题（确保数量）
+                while len(questions) < QUESTIONS_PER_LEVEL:
+                    questions.append(
+                        f"[{self.topic} {level_cn}] 补充问题 {len(questions) + 1}"
+                    )
+                # 如果超过 100，截断
+                questions = questions[:QUESTIONS_PER_LEVEL]
+
+                # 写入阶段 2 的原始输出记录
+                phase2_record: dict[str, Any] = {
+                    "phase": 2,
+                    "type": "question_list",
+                    "level": level_label,
+                    "topic": topic_label,
+                    "timestamp": datetime.now().isoformat(),
+                    "questions": questions,
+                }
+                self._write_jsonl(phase2_record)
+
+                # 将问题加入主清单
+                for q in questions:
+                    question_id += 1
+                    all_questions.append(
+                        {
+                            "id": question_id,
+                            "level": level_label,
+                            "question": q,
+                        }
+                    )
+
+            except Exception as e:
+                self._raise_if_auth_error(e)
+                print(f"[错误] {level_cn} 级别问题生成失败：{e}")
+                # 降级处理：生成占位问题，确保流程继续
+                for i in range(QUESTIONS_PER_LEVEL):
+                    question_id += 1
+                    all_questions.append(
+                        {
+                            "id": question_id,
+                            "level": level_en,
+                            "question": f"[{self.topic} {level_cn}] 默认问题 {i + 1}（生成失败时的降级问题）",
+                        }
+                    )
+
+                # 记录错误
+                error_record: dict[str, Any] = {
+                    "phase": 2,
+                    "type": "question_list_error",
+                    "level": level_en,
+                    "timestamp": datetime.now().isoformat(),
+                    "error": str(e),
+                }
+                self._write_jsonl(error_record)
+
+        print(f"\n[阶段 2] 问题清单生成完毕，总计 {len(all_questions)} 个问题")
+        return all_questions
+
+    # ==========================================================================
+    # 阶段 3：逐个问题深度分析（联网搜索 + JSON Mode）
+    # ==========================================================================
+
+    def phase3_analyze_questions(self, questions: list[dict[str, Any]]) -> None:
+        """
+        阶段 3：遍历所有问题，逐个进行联网搜索并深度分析
+
+        Args:
+            questions: 阶段 2 生成的完整问题列表
+        """
+        print(f"\n{'='*60}")
+        print(f"🧠 阶段 3：逐个问题深度分析")
+        print(f"{'='*60}")
+
+        # 应用 max_questions 限制
+        questions = questions[: self.max_questions]
+        print(
+            f"[阶段 3] 实际需要处理的问题数：{len(questions)}（max_questions={self.max_questions}）"
+        )
+
+        # 应用断点续传（跳过已完成的问题）
+        start_index = max(0, self.resume_from)
+        if start_index > 0:
+            print(
+                f"[断点续传] 跳过前 {start_index} 个问题，从第 {start_index + 1} 个问题开始"
+            )
+        questions = questions[start_index:]
+
+        # 初始化进度条
+        pbar = tqdm(
+            total=len(questions),
+            desc="深度分析进度",
+            unit="题",
+            ncols=80,
+            initial=0,
+        )
+
+        for idx, q_item in enumerate(questions, start=start_index + 1):
+            question_text = q_item["question"]
+            level = q_item["level"]
+            q_id = q_item["id"]
+
+            pbar.set_description(
+                f"[{idx}/{start_index + len(questions)}] {question_text[:30]}..."
+            )
+
+            # 步骤 A：联网搜索该问题的相关资料
+            search_prompt = (
+                f"请搜索网页，搜索以下问题的相关资料和权威解释：\n"
+                f"主题：{self.topic}\n"
+                f"问题：{question_text}\n\n"
+                f"请基于搜索结果，提供该问题的背景信息、核心概念解释、以及可能的答案要点。"
+            )
+
+            search_result_text = ""
+            try:
+                search_response = self._call_api(
+                    system_prompt=f"你是 {self.topic} 领域的专家，擅长通过搜索获取权威信息。",
+                    user_prompt=search_prompt,
+                    enable_web_search=True,
+                )
+                search_result_text = self._extract_message_content(search_response)
+            except Exception as e:
+                self._raise_if_auth_error(e)
+                search_result_text = f"搜索阶段出错：{e}"
+                print(f"[警告] 问题 {q_id} 搜索失败：{e}")
+
+            # 步骤 B：基于搜索结果，使用 JSON Mode 输出结构化分析
+            analysis_system_prompt = (
+                f"你是 {self.topic} 领域的资深专家。"
+                f"请根据提供的搜索结果，对给定问题进行深度分析。"
+                f"以 JSON 格式输出，不要添加任何额外说明文字。"
+            )
+
+            analysis_user_prompt = (
+                f"请深度分析以下问题，并严格按照 JSON 格式输出：\n\n"
+                f"主题：{self.topic}\n"
+                f"问题：{question_text}\n"
+                f"级别：{level}\n\n"
+                f"搜索结果参考：\n{search_result_text}\n\n"
+                f"输出格式（必须严格遵守，确保是合法 JSON）：\n"
+                f"{{\n"
+                f'  "id": {q_id},\n'
+                f'  "level": "{level}",\n'
+                f'  "question": "{question_text}",\n'
+                f'  "analysis": "深度分析内容（300字以上，结构清晰）",\n'
+                f'  "key_points": ["要点1", "要点2", "要点3"],\n'
+                f'  "sources": ["来源URL或摘要1", "来源URL或摘要2"],\n'
+                f'  "difficulty": "初级/中级/高级"\n'
+                f"}}"
+            )
+
+            record: dict[str, Any]
+
+            try:
+                analysis_response = self._call_api(
+                    system_prompt=analysis_system_prompt,
+                    user_prompt=analysis_user_prompt,
+                    enable_json_mode=True,
+                )
+                content = self._extract_message_content(analysis_response, default="{}")
+                parsed = self._safe_parse_json(content)
+
+                # 确保必要字段存在
+                record = {
+                    "phase": 3,
+                    "type": "analysis",
+                    "id": parsed.get("id", q_id),
+                    "level": parsed.get("level", level),
+                    "question": parsed.get("question", question_text),
+                    "analysis": parsed.get("analysis", "分析内容为空"),
+                    "key_points": parsed.get("key_points", []),
+                    "sources": parsed.get("sources", []),
+                    "difficulty": parsed.get("difficulty", level),
+                    "timestamp": datetime.now().isoformat(),
+                }
+
+            except Exception as e:
+                self._raise_if_auth_error(e)
+                # JSON 解析或 API 调用失败时的降级处理
+                print(f"[警告] 问题 {q_id} 分析解析失败，使用降级格式：{e}")
+                record = {
+                    "phase": 3,
+                    "type": "analysis",
+                    "id": q_id,
+                    "level": level,
+                    "question": question_text,
+                    "analysis": f"分析生成失败（错误：{e}）。原始搜索结果：{search_result_text[:500]}",
+                    "key_points": ["分析失败，请手动补充"],
+                    "sources": [],
+                    "difficulty": level,
+                    "timestamp": datetime.now().isoformat(),
+                    "error": str(e),
+                }
+
+            # 写入结果（每 FLUSH_INTERVAL 条强制刷新）
+            flush = idx % FLUSH_INTERVAL == 0
+            self._write_jsonl(record, flush=flush)
+
+            # 更新进度条
+            pbar.update(1)
+
+            # 每 COST_REPORT_INTERVAL 个问题打印一次累计报告
+            if idx % COST_REPORT_INTERVAL == 0:
+                self._print_progress_report(idx)
+
+        pbar.close()
+        print(f"\n[阶段 3] 全部 {len(questions)} 个问题分析完成！")
+
+    # ==========================================================================
+    # 主控流程
+    # ==========================================================================
+
+    def run(self) -> None:
+        """
+        执行完整的知识库构建流程
+        """
+        print("\n" + "=" * 60)
+        print("🚀 Kimi API 知识库构建脚本启动")
+        print("=" * 60)
+        print(f"主题：{self.topic}")
+        print(f"受众：{self.audience}")
+        print(f"输出：{os.path.abspath(self.output_path)}")
+        print(f"断点续传：从第 {self.resume_from} 个问题开始")
+        print(f"最大问题数：{self.max_questions}")
+        print("=" * 60)
+
+        try:
+            # 阶段 1：主题调研
+            research_result = self.phase1_research()
+
+            # 阶段 2：生成问题清单
+            # 如果 resume_from > 0，尝试从已有输出文件恢复问题清单（避免重复生成）
+            if self.resume_from > 0 and os.path.exists(self.output_path):
+                print("\n[断点续传] 尝试从已有输出文件中恢复问题清单...")
+                restored = self._restore_questions_from_file()
+                if restored:
+                    self.all_questions = restored
+                    print(f"[断点续传] 成功恢复 {len(restored)} 个问题")
+                else:
+                    print("[断点续传] 未能从文件中恢复问题清单，重新生成...")
+                    self.all_questions = self.phase2_generate_questions(
+                        research_result["summary"]
+                    )
+            else:
+                self.all_questions = self.phase2_generate_questions(
+                    research_result["summary"]
+                )
+
+            # 打印成本预估
+            actual_max = min(len(self.all_questions), self.max_questions)
+            self._print_cost_estimate(actual_max)
+
+            # 阶段 3：逐个深度分析
+            self.phase3_analyze_questions(self.all_questions)
+
+            # 最终总结
+            elapsed = time.time() - self.start_time
+            print("\n" + "=" * 60)
+            print("🎉 知识库构建全部完成！")
+            print("=" * 60)
+            print(f"📁 输出文件：{os.path.abspath(self.output_path)}")
+            print(f"⏱️  总耗时：{elapsed:.1f} 秒")
+            print(f"📡 API 总调用次数：{self.total_api_calls}")
+            print(f"📝 累计输入 Token：{self.total_input_tokens:,}")
+            print(f"📝 累计输出 Token：{self.total_output_tokens:,}")
+            print("=" * 60 + "\n")
+
+        except KeyboardInterrupt:
+            print("\n\n[中断] 用户手动中断执行，已保存的进度不会丢失。")
+            print(f"[中断] 当前进度已写入：{os.path.abspath(self.output_path)}")
+            print(
+                f"[中断] 如需续传，请使用 --resume 参数指定已完成的最后一个问题序号。"
+            )
+            sys.exit(0)
+
+        except Exception as e:
+            print(f"\n[致命错误] 构建流程异常终止：{e}")
+            print(f"[致命错误] 已保存的进度文件：{os.path.abspath(self.output_path)}")
+            # 确保缓冲区数据落盘
+            self.output_file.flush()
+            os.fsync(self.output_file.fileno())
+            raise
+
+        finally:
+            # 确保文件正确关闭
+            self.output_file.flush()
+            os.fsync(self.output_file.fileno())
+            self.output_file.close()
+            print("[清理] 输出文件已安全关闭。")
+
+    def _restore_questions_from_file(self) -> Optional[list[dict[str, Any]]]:
+        """
+        从已有的输出文件中恢复问题清单（用于断点续传）
+
+        Returns:
+            恢复成功返回问题列表，否则返回 None
+        """
+        questions: list[dict[str, Any]] = []
+        try:
+            with open(self.output_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        if (
+                            record.get("phase") == 2
+                            and record.get("type") == "question_list"
+                        ):
+                            level = record.get("level", "unknown")
+                            for q in record.get("questions", []):
+                                questions.append(
+                                    {
+                                        "id": len(questions) + 1,
+                                        "level": level,
+                                        "question": q,
+                                    }
+                                )
+                    except json.JSONDecodeError:
+                        continue
+            return questions if questions else None
+        except Exception:
+            return None
+
+
+# ==============================================================================
+# 命令行参数解析与主入口
+# ==============================================================================
+
+
+def main() -> None:
+    """
+    命令行入口函数
+    """
+    parser = argparse.ArgumentParser(
+        description="Kimi API 知识库构建脚本 —— 基于联网搜索自动生成结构化知识库",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例：
+  export MOONSHOT_API_KEY="your-api-key"
+  python knowledge_base_builder.py --topic "量子计算"
+  python knowledge_base_builder.py --topic "React 18" --audience intermediate --output ./react.jsonl
+  python knowledge_base_builder.py --topic "Docker" --resume 50 --max-questions 200
+        """,
+    )
+
+    parser.add_argument(
+        "--topic",
+        type=str,
+        required=True,
+        help="知识库主题（必填，例如：量子计算、React 18、Docker）",
+    )
+    parser.add_argument(
+        "--audience",
+        type=str,
+        default=DEFAULT_AUDIENCE,
+        choices=["beginner", "intermediate", "advanced"],
+        help="目标受众级别（默认：beginner）",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=DEFAULT_OUTPUT,
+        help=f"输出文件路径（默认：{DEFAULT_OUTPUT}）",
+    )
+    parser.add_argument(
+        "--resume",
+        type=int,
+        default=0,
+        metavar="N",
+        help="断点续传，从第 N 个问题开始（默认：0，即从头开始）",
+    )
+    parser.add_argument(
+        "--max-questions",
+        type=int,
+        default=DEFAULT_MAX_QUESTIONS,
+        help=f"最大问题数限制（默认：{DEFAULT_MAX_QUESTIONS}，即三级各100个）",
+    )
+
+    args = parser.parse_args()
+
+    # 参数校验
+    if args.max_questions <= 0:
+        print("[错误] --max-questions 必须大于 0")
+        sys.exit(1)
+    if args.resume < 0:
+        print("[错误] --resume 不能为负数")
+        sys.exit(1)
+
+    # 创建构建器并执行
+    builder = KnowledgeBaseBuilder(
+        topic=args.topic,
+        audience=args.audience,
+        output_path=args.output,
+        resume_from=args.resume,
+        max_questions=args.max_questions,
+    )
+    builder.run()
+
+
+if __name__ == "__main__":
+    main()
