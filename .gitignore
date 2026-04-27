@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Type check / tooling cache
+.mypy_cache/
+.pytest_cache/
+
+# Local secrets
+.env
+
+# Runtime outputs
+*.jsonl
