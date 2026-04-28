@@ -34,14 +34,14 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 
 ```powershell
 python -m pip install --upgrade pip
-python -m pip install openai tenacity tqdm
+python -m pip install -r requirements.txt
 ```
 
 如果遇到 `ReadTimeoutError`（例如访问 `pypi.org` 超时），可临时使用清华镜像：
 
 ```powershell
 python -m pip install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple --upgrade pip
-python -m pip install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple openai tenacity tqdm
+python -m pip install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple -r requirements.txt
 ```
 
 如需长期使用镜像（推荐国内网络环境）：
@@ -197,12 +197,45 @@ deactivate
 
 ---
 
-## 8. 项目文件（当前）
+## 8. 项目文件（重构后）
 
-- `knowledge_base_builder.py`：主脚本
+- `knowledge_base_builder.py`：主入口与流程编排（`KnowledgeBaseBuilder`）
+- `config.py`：配置、参数校验、日志与路径安全
+- `api_client.py`：Kimi API 客户端封装（重试、超时、联网工具闭环）
+- `question_generator.py`：三级问题清单生成
+- `answer_analyzer.py`：逐题搜索与分析
+- `models.py`：Pydantic 数据模型与 JSON Schema
+- `storage.py`：JSONL 原子写入与 Markdown 输出
+- `tests/`：pytest 单元测试
+- `.github/workflows/ci.yml`：CI 自动化测试
 - `.env`：本地私有配置（自动加载，不要提交）
 - `.env.example`：环境变量示例模板（可提交）
 - `.gitignore`：Git 忽略规则（已包含 `.env`）
 - `README.md`：本说明文档
+
+---
+
+## 9. 质量属性（ISO/IEC 25010）
+
+本项目在重构后重点覆盖以下质量属性：
+
+- **Reliability（可靠性）**：tenacity 指数退避重试、请求超时控制、JSON Schema 响应校验、JSONL 原子写入。
+- **Maintainability（可维护性）**：模块化拆分、面向对象主流程、完整类型注解与 Google-style docstring、结构化日志。
+- **Testability（可测试性）**：pytest 单测、可注入客户端便于 Mock、CI 自动执行测试。
+- **Portability（可移植性）**：兼容 Windows/Linux/macOS，支持 Python 3.8-3.12，支持代理环境变量。
+- **Security（安全性）**：API Key 仅环境变量/.env、日志脱敏、输出路径安全检查（防路径穿越）。
+- **Usability（易用性）**：文档补齐（INSTALL/ARCHITECTURE/API_REFERENCE/TEST_PLAN 等），CLI 参数说明与错误提示优化。
+
+---
+
+## 10. 扩展文档
+
+- `INSTALL.md`：三平台安装指南
+- `ARCHITECTURE.md`：架构设计说明
+- `API_REFERENCE.md`：接口与数据格式
+- `TEST_PLAN.md`：测试计划与用例
+- `CHANGELOG.md`：版本变更记录
+- `CONTRIBUTING.md`：贡献流程
+- `SECURITY.md`：安全策略
 
 祝你构建知识库顺利 🚀
