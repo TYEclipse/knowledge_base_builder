@@ -1235,7 +1235,7 @@ class KnowledgeBaseBuilder:
                 f'  "id": {q_id},\n'
                 f'  "level": "{level}",\n'
                 f'  "question": "{question_text}",\n'
-                f'  "analysis": "深度分析内容（200~500字，结构清晰）",\n'
+                f'  "analysis": "深度分析内容（结构清晰、论证充分）",\n'
                 f'  "key_points": ["要点1", "要点2", "要点3"],\n'
                 f'  "sources": ["来源URL或摘要1", "来源URL或摘要2"],\n'
                 f'  "difficulty": "初级/中级/高级"\n'
