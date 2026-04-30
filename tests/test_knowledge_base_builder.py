@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -355,3 +356,49 @@ def test_phase2_incremental_generation_writes_markdown_per_level_immediately(
         ("append", "intermediate"),
         ("markdown", "intermediate"),
     ]
+
+
+def test_add_boolean_optional_argument_fallback_without_boolean_optional_action(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delattr(kbb.argparse, "BooleanOptionalAction", raising=False)
+
+    parser = argparse.ArgumentParser()
+    kbb._add_boolean_optional_argument(
+        parser,
+        "--stream",
+        default=True,
+        help_text="是否启用流式输出",
+    )
+
+    assert parser.parse_args([]).stream is True
+    assert parser.parse_args(["--no-stream"]).stream is False
+    assert parser.parse_args(["--stream"]).stream is True
+
+
+def test_phase2_incremental_generation_resume_nonzero_skips_markdown_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class IncrementalQuestionGenerator:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate_incrementally(self, summary):
+            yield (
+                [{"id": 1, "level": "beginner", "question": "Q1"}],
+                {"level": "beginner", "questions": ["Q1"]},
+            )
+
+    monkeypatch.setattr(kbb, "KimiApiClient", DummyApiClient)
+    monkeypatch.setattr(kbb, "AtomicJsonlWriter", DummyWriter)
+    monkeypatch.setattr(kbb, "MarkdownWriter", DummyMarkdownWriter)
+    monkeypatch.setattr(kbb, "QuestionGenerator", IncrementalQuestionGenerator)
+    monkeypatch.setattr(kbb, "AnswerAnalyzer", DummyAnswerAnalyzer)
+
+    settings = make_settings(tmp_path)
+    settings.resume = 1
+    b = kbb.KnowledgeBaseBuilder(settings)
+
+    qs = b.phase2_questions("summary")
+    assert len(qs) == 1
+    assert cast(Any, b.markdown_writer).calls == []
