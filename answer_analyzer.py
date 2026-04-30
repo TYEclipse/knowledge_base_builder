@@ -1,4 +1,5 @@
 """阶段三：逐题深度分析模块。"""
+
 from __future__ import annotations
 
 import importlib
@@ -33,7 +34,9 @@ class AnswerAnalyzer:
             return text
         return text[:limit] + "\n...(以下内容已截断)..."
 
-    def _search_context(self, question: str, research_summary: str) -> str:
+    def _search_context(
+        self, question: str, research_summary: str, item_index: int, item_total: int
+    ) -> str:
         search_prompt = (
             f"请搜索网页，回答问题相关资料：\n"
             f"主题：{self.topic}\n"
@@ -46,10 +49,29 @@ class AnswerAnalyzer:
             user_prompt=search_prompt,
             enable_web_search=True,
             max_tokens=PHASE3_SEARCH_MAX_TOKENS,
+            progress_context={
+                "stage_name": "逐题深度分析",
+                "stage_index": 3,
+                "stage_total": 3,
+                "substep_name": "搜索资料",
+                "item_name": question[:30],
+                "item_index": item_index,
+                "item_total": item_total,
+                "request_group": "phase3_search",
+            },
         )
         return self.api_client.extract_message_content(response)
 
-    def _analyze(self, q_id: int, level: str, question: str, research_summary: str, search_result: str) -> Dict[str, Any]:
+    def _analyze(
+        self,
+        q_id: int,
+        level: str,
+        question: str,
+        research_summary: str,
+        search_result: str,
+        item_index: int,
+        item_total: int,
+    ) -> Dict[str, Any]:
         analysis_prompt = (
             "请深度分析并严格输出 JSON：\n\n"
             f"主题：{self.topic}\n"
@@ -59,13 +81,13 @@ class AnswerAnalyzer:
             f"搜索结果：\n{self._truncate(search_result, MAX_SEARCH_RESULT_PROMPT_CHARS)}\n\n"
             "输出格式："
             "{"
-            f"\"id\":{q_id},"
-            f"\"level\":\"{level}\","
-            f"\"question\":\"{question}\","
-            "\"analysis\":\"...\","
-            "\"key_points\":[\"...\"],"
-            "\"sources\":[\"...\"],"
-            "\"difficulty\":\"初级/中级/高级\""
+            f'"id":{q_id},'
+            f'"level":"{level}",'
+            f'"question":"{question}",'
+            '"analysis":"...",'
+            '"key_points":["..."],'
+            '"sources":["..."],'
+            '"difficulty":"初级/中级/高级"'
             "}"
         )
         response = self.api_client.call(
@@ -73,14 +95,28 @@ class AnswerAnalyzer:
             user_prompt=analysis_prompt,
             enable_json_mode=True,
             max_tokens=PHASE3_ANALYSIS_MAX_TOKENS,
+            progress_context={
+                "stage_name": "逐题深度分析",
+                "stage_index": 3,
+                "stage_total": 3,
+                "substep_name": "生成答案",
+                "item_name": question[:30],
+                "item_index": item_index,
+                "item_total": item_total,
+                "request_group": "phase3_analysis",
+            },
         )
-        payload = self.api_client.safe_parse_json(self.api_client.extract_message_content(response, default="{}"))
+        payload = self.api_client.safe_parse_json(
+            self.api_client.extract_message_content(response, default="{}")
+        )
         jsonschema = importlib.import_module("jsonschema")
         jsonschema.validate(instance=payload, schema=PHASE3_SCHEMA)
         return payload
 
     @staticmethod
-    def _print_progress_report(completed: int, max_questions: int, stats: Any, start_time: float) -> None:
+    def _print_progress_report(
+        completed: int, max_questions: int, stats: Any, start_time: float
+    ) -> None:
         import time
 
         elapsed = time.time() - start_time
@@ -109,16 +145,25 @@ class AnswerAnalyzer:
 
         pbar = tqdm(total=len(questions), desc="深度分析进度", unit="题", ncols=80)
 
+        total_items = start_index + len(questions)
+
         for idx, q_item in enumerate(questions, start=start_index + 1):
             q_id = int(q_item["id"])
             level = str(q_item["level"])
             question = str(q_item["question"])
 
-            pbar.set_description(f"[{idx}/{start_index + len(questions)}] {question[:30]}...")
+            pbar.set_description(
+                f"[{idx}/{start_index + len(questions)}] {question[:30]}..."
+            )
 
             error_text = ""
             try:
-                search_result = self._search_context(question=question, research_summary=research_summary)
+                search_result = self._search_context(
+                    question=question,
+                    research_summary=research_summary,
+                    item_index=idx,
+                    item_total=total_items,
+                )
             except Exception as exc:
                 search_result = f"搜索阶段失败：{exc}"
                 error_text = str(exc)
@@ -130,6 +175,8 @@ class AnswerAnalyzer:
                     question=question,
                     research_summary=research_summary,
                     search_result=search_result,
+                    item_index=idx,
+                    item_total=total_items,
                 )
                 model = Phase3Response(
                     id=int(payload.get("id", q_id)),

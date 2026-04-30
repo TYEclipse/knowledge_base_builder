@@ -107,7 +107,7 @@ python .\knowledge_base_builder.py --topic "Docker" --resume 50
 ### 快速测试（仅处理 10 个问题）
 
 ```powershell
-python .\knowledge_base_builder.py --topic "Kubernetes" --max-questions 10
+python .\knowledge_base_builder.py --topic "哲学" --max-questions 3
 ```
 
 ---

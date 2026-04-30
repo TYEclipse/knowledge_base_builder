@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Kimi API 知识库构建器主入口。"""
+
 from __future__ import annotations
 
 import argparse
@@ -55,7 +56,9 @@ class KnowledgeBaseBuilder:
 
         output_path = Path(settings.output_path)
         markdown_dir = Path(
-            normalize_markdown_output_dir(settings.markdown_output, settings.output_path)
+            normalize_markdown_output_dir(
+                settings.markdown_output, settings.output_path
+            )
         )
 
         self.writer = AtomicJsonlWriter(path=output_path)
@@ -102,9 +105,7 @@ class KnowledgeBaseBuilder:
         print(f"🔍 阶段 1：主题调研 —— {self.settings.topic}")
         print("=" * 60)
 
-        system_prompt = (
-            f"你是 {self.settings.topic} 领域资深技术专家，请基于检索输出结构化调研摘要。"
-        )
+        system_prompt = f"你是 {self.settings.topic} 领域资深技术专家，请基于检索输出结构化调研摘要。"
         user_prompt = (
             f"请搜索并调研主题 '{self.settings.topic}'：\n"
             "1. 核心定义与概念\n"
@@ -121,11 +122,20 @@ class KnowledgeBaseBuilder:
                 user_prompt=user_prompt,
                 enable_web_search=True,
                 max_tokens=PHASE1_MAX_TOKENS,
+                progress_context={
+                    "stage_name": "主题调研",
+                    "stage_index": 1,
+                    "stage_total": 3,
+                    "item_name": self.settings.topic,
+                    "request_group": "phase1_research",
+                },
             )
             summary = self.api_client.extract_message_content(response)
             self._validate_research_summary(summary)
 
-            record = JsonlRecordFactory.phase1(topic=self.settings.topic, summary=summary)
+            record = JsonlRecordFactory.phase1(
+                topic=self.settings.topic, summary=summary
+            )
             self.writer.append(record, flush=True)
             if self.settings.resume == 0:
                 self.markdown_writer.write_research(summary)
@@ -222,7 +232,9 @@ class KnowledgeBaseBuilder:
             else:
                 questions = self.phase2_questions(self.research_summary)
 
-            self._print_cost_estimate(num_questions=min(len(questions), self.settings.max_questions))
+            self._print_cost_estimate(
+                num_questions=min(len(questions), self.settings.max_questions)
+            )
 
             print("\n" + "=" * 60)
             print("🧠 阶段 3：逐题深度分析")
@@ -249,6 +261,11 @@ class KnowledgeBaseBuilder:
             print(f"输出 Token：{self.stats.total_output_tokens:,}")
             print("=" * 60)
 
+        except KeyboardInterrupt:
+            print("\n\n[中断] 检测到用户中断，已停止执行并保留已写入数据。")
+            print(f"[中断] 当前输出文件：{self.settings.output_path}")
+            print("[中断] 可使用 --resume 从指定题号继续。")
+
         finally:
             self.writer.flush()
             self.api_client.close()
@@ -268,7 +285,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["beginner", "intermediate", "advanced"],
         help="目标受众",
     )
-    parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT, help="JSONL 输出路径")
+    parser.add_argument(
+        "--output", type=str, default=DEFAULT_OUTPUT, help="JSONL 输出路径"
+    )
     parser.add_argument(
         "--markdown-output",
         type=str,
@@ -303,7 +322,9 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        settings = build_settings_from_args(args=args, project_root=Path(__file__).resolve().parent)
+        settings = build_settings_from_args(
+            args=args, project_root=Path(__file__).resolve().parent
+        )
         builder = KnowledgeBaseBuilder(settings=settings)
         builder.run()
     except Exception as exc:
