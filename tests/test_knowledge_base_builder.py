@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -56,7 +57,10 @@ class DummyQuestionGenerator:
         pass
 
     def generate(self, summary):
-        return ([{"id": 1, "level": "beginner", "question": "Q1"}], [{"level": "beginner", "questions": ["Q1"]}])
+        return (
+            [{"id": 1, "level": "beginner", "question": "Q1"}],
+            [{"level": "beginner", "questions": ["Q1"]}],
+        )
 
 
 class DummyAnswerAnalyzer:
@@ -121,7 +125,9 @@ def test_validate_research_summary_short_raises():
         kbb.KnowledgeBaseBuilder._validate_research_summary("short")
 
 
-def test_phase1_auth_error_raises_runtime_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_phase1_auth_error_raises_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     class AuthFailApi(DummyApiClient):
         def call(self, **kwargs):
             raise RuntimeError("auth")
@@ -140,7 +146,9 @@ def test_phase1_auth_error_raises_runtime_error(tmp_path: Path, monkeypatch: pyt
         builder.phase1_research()
 
 
-def test_phase1_non_auth_fallback_and_resume_restore_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_phase1_non_auth_fallback_and_resume_restore_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     class NonAuthFailApi(DummyApiClient):
         def call(self, **kwargs):
             raise RuntimeError("network")
@@ -161,7 +169,16 @@ def test_phase1_non_auth_fallback_and_resume_restore_path(tmp_path: Path, monkey
     rec = builder.phase1_research()
     assert "error" in rec
 
-    builder.phase2_questions = lambda summary: (_ for _ in ()).throw(AssertionError("should not call phase2_questions when restored"))  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        builder,
+        "phase2_questions",
+        cast(
+            Any,
+            lambda summary: (_ for _ in ()).throw(
+                AssertionError("should not call phase2_questions when restored")
+            ),
+        ),
+    )
     builder.run()
 
 
@@ -175,13 +192,19 @@ def test_build_arg_parser_and_main_failure_path(monkeypatch: pytest.MonkeyPatch)
             return SimpleNamespace()
 
     monkeypatch.setattr(kbb, "build_arg_parser", lambda: DummyParser())
-    monkeypatch.setattr(kbb, "build_settings_from_args", lambda args, project_root: (_ for _ in ()).throw(ValueError("bad")))
+    monkeypatch.setattr(
+        kbb,
+        "build_settings_from_args",
+        lambda args, project_root: (_ for _ in ()).throw(ValueError("bad")),
+    )
 
     with pytest.raises(SystemExit):
         kbb.main()
 
 
-def test_truncate_and_phase1_resume_skip_markdown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_truncate_and_phase1_resume_skip_markdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     monkeypatch.setattr(kbb, "KimiApiClient", DummyApiClient)
     monkeypatch.setattr(kbb, "AtomicJsonlWriter", DummyWriter)
     monkeypatch.setattr(kbb, "MarkdownWriter", DummyMarkdownWriter)
@@ -198,10 +221,12 @@ def test_truncate_and_phase1_resume_skip_markdown(tmp_path: Path, monkeypatch: p
     rec = b.phase1_research()
     assert rec["phase"] == 1
     # resume>0 时不写 research markdown
-    assert b.markdown_writer.calls == []
+    assert cast(Any, b.markdown_writer).calls == []
 
 
-def test_phase2_resume_nonzero_skips_markdown_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_phase2_resume_nonzero_skips_markdown_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     monkeypatch.setattr(kbb, "KimiApiClient", DummyApiClient)
     monkeypatch.setattr(kbb, "AtomicJsonlWriter", DummyWriter)
     monkeypatch.setattr(kbb, "MarkdownWriter", DummyMarkdownWriter)
@@ -213,10 +238,12 @@ def test_phase2_resume_nonzero_skips_markdown_write(tmp_path: Path, monkeypatch:
     b = kbb.KnowledgeBaseBuilder(settings)
     qs = b.phase2_questions("summary")
     assert len(qs) == 1
-    assert b.markdown_writer.calls == []
+    assert cast(Any, b.markdown_writer).calls == []
 
 
-def test_run_resume_restore_none_goes_to_phase2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_run_resume_restore_none_goes_to_phase2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     monkeypatch.setattr(kbb, "KimiApiClient", DummyApiClient)
     monkeypatch.setattr(kbb, "AtomicJsonlWriter", DummyWriter)
     monkeypatch.setattr(kbb, "MarkdownWriter", DummyMarkdownWriter)
@@ -247,9 +274,29 @@ def test_main_success_path(monkeypatch: pytest.MonkeyPatch):
             return SimpleNamespace()
 
     monkeypatch.setattr(kbb, "build_arg_parser", lambda: DummyParser())
-    monkeypatch.setattr(kbb, "build_settings_from_args", lambda args, project_root: SimpleNamespace())
+    monkeypatch.setattr(
+        kbb, "build_settings_from_args", lambda args, project_root: SimpleNamespace()
+    )
     monkeypatch.setattr(kbb, "KnowledgeBaseBuilder", DummyBuilderForMain)
 
     DummyBuilderForMain.called = False
     kbb.main()
     assert DummyBuilderForMain.called is True
+
+
+def test_run_handles_keyboard_interrupt_gracefully(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class KIAnswerAnalyzer(DummyAnswerAnalyzer):
+        def run(self, **kwargs):
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(kbb, "KimiApiClient", DummyApiClient)
+    monkeypatch.setattr(kbb, "AtomicJsonlWriter", DummyWriter)
+    monkeypatch.setattr(kbb, "MarkdownWriter", DummyMarkdownWriter)
+    monkeypatch.setattr(kbb, "QuestionGenerator", DummyQuestionGenerator)
+    monkeypatch.setattr(kbb, "AnswerAnalyzer", KIAnswerAnalyzer)
+
+    b = kbb.KnowledgeBaseBuilder(make_settings(tmp_path))
+    # 不应抛出 KeyboardInterrupt 到测试层
+    b.run()
