@@ -1012,6 +1012,89 @@ def test_start_progress_heartbeat_none_context_returns_none_event():
     client.close()
 
 
+def test_info_overwrite_passes_extra_kwargs_when_logger_supports_it():
+    class Logger:
+        def __init__(self):
+            self.kwargs = None
+
+        def info(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    logger = Logger()
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=False,
+        logger=logger,
+        stats=None,
+        openai_client=DummyClient('{"ok":true}'),
+    )
+
+    client._info("progress", overwrite=True)
+
+    assert logger.kwargs == {"extra": {"overwrite": True}}
+    client.close()
+
+
+def test_create_completion_streaming_only_logs_summary_debug_once():
+    class StreamClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self._create)
+            )
+
+        def _create(self, **kwargs):
+            return [
+                DummyChunk(
+                    {
+                        "choices": [
+                            {"delta": {"content": "hello "}, "finish_reason": None}
+                        ],
+                    }
+                ),
+                DummyChunk(
+                    {
+                        "choices": [
+                            {"delta": {"content": "world"}, "finish_reason": "stop"}
+                        ]
+                    }
+                ),
+            ]
+
+    class Logger:
+        def __init__(self):
+            self.debug_calls = []
+            self.info_calls = []
+
+        def debug(self, message, *args, **kwargs):
+            self.debug_calls.append(message % args)
+
+        def info(self, message, *args, **kwargs):
+            self.info_calls.append(message % args)
+
+    logger = Logger()
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=True,
+        logger=logger,
+        stats=None,
+        openai_client=StreamClient(),
+    )
+
+    response = client._create_completion_streaming(
+        {"model": "kimi-k2.6", "messages": [{"role": "user", "content": "u"}]}
+    )
+
+    assert KimiApiClient.extract_message_content(response) == "hello world"
+    assert len(logger.debug_calls) == 1
+    assert "流式聚合完成" in logger.debug_calls[0]
+    assert any("请求完成" in msg for msg in logger.info_calls)
+    client.close()
+
+
 def test_debug_call_and_duration_bucket_trim_and_item_name_progress_branch():
     class Logger:
         def __init__(self):

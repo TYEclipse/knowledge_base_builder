@@ -162,21 +162,40 @@ class KnowledgeBaseBuilder:
         print("📝 阶段 2：生成三级问题清单")
         print("=" * 60)
 
-        questions, phase2_records = self.question_generator.generate(research_summary)
-        for record in phase2_records:
-            self.writer.append(record)
-            if self.settings.resume == 0:
-                level = str(record.get("level", ""))
-                level_cn_map = {
-                    "beginner": "初学者",
-                    "intermediate": "中级学习者",
-                    "advanced": "高级学习者",
-                }
-                self.markdown_writer.write_question_list(
-                    level_en=level,
-                    level_cn=level_cn_map.get(level, level),
-                    questions=list(record.get("questions", [])),
-                )
+        questions: List[Dict[str, Any]] = []
+        level_cn_map = {
+            "beginner": "初学者",
+            "intermediate": "中级学习者",
+            "advanced": "高级学习者",
+        }
+
+        if hasattr(self.question_generator, "generate_incrementally"):
+            for (
+                level_questions,
+                record,
+            ) in self.question_generator.generate_incrementally(research_summary):
+                questions.extend(level_questions)
+                self.writer.append(record)
+                if self.settings.resume == 0:
+                    level = str(record.get("level", ""))
+                    self.markdown_writer.write_question_list(
+                        level_en=level,
+                        level_cn=level_cn_map.get(level, level),
+                        questions=list(record.get("questions", [])),
+                    )
+        else:
+            questions, phase2_records = self.question_generator.generate(
+                research_summary
+            )
+            for record in phase2_records:
+                self.writer.append(record)
+                if self.settings.resume == 0:
+                    level = str(record.get("level", ""))
+                    self.markdown_writer.write_question_list(
+                        level_en=level,
+                        level_cn=level_cn_map.get(level, level),
+                        questions=list(record.get("questions", [])),
+                    )
         self.writer.flush()
         return questions
 
