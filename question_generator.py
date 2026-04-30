@@ -21,6 +21,7 @@ class QuestionGenerator:
         self.topic = topic
         self.api_client = api_client
         self.logger = logger
+        self.reasoning_effort = "high"
 
     @staticmethod
     def _truncate(text: str, limit: int) -> str:
@@ -68,6 +69,8 @@ class QuestionGenerator:
                 user_prompt=user_prompt,
                 enable_json_mode=True,
                 max_tokens=PHASE2_MAX_TOKENS,
+                use_deepseek_thinking=True,
+                reasoning_effort=self.reasoning_effort,
                 progress_context={
                     "stage_name": "问题清单生成",
                     "stage_index": 2,

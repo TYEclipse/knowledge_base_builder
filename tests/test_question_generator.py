@@ -103,3 +103,40 @@ def test_generate_incrementally_emits_level_batches_with_continuous_ids():
     assert batches[0][1]["level"] == "beginner"
     assert batches[1][1]["level"] == "intermediate"
     assert batches[2][1]["level"] == "advanced"
+
+
+def test_generate_level_questions_uses_deepseek_thinking_mode():
+    class TrackingApiClient:
+        def __init__(self):
+            self.last_call_kwargs = {}
+
+        def call(self, **kwargs):
+            self.last_call_kwargs = kwargs
+            return SimpleNamespace(content="ok")
+
+        def extract_message_content(self, response, default=""):
+            payload = {
+                "level": "beginner",
+                "topic": "AI",
+                "questions": ["q1", "q2"],
+            }
+            return json.dumps(payload, ensure_ascii=False)
+
+        def safe_parse_json(self, text: str):
+            return json.loads(text)
+
+    api = TrackingApiClient()
+    gen = QuestionGenerator(topic="AI", api_client=api, logger=DummyLogger())
+    gen.reasoning_effort = "max"
+
+    gen._generate_level_questions(
+        level_en="beginner",
+        level_cn="初学者",
+        research_summary="summary",
+        level_idx=1,
+        total_levels=3,
+        start_qid=0,
+    )
+
+    assert api.last_call_kwargs["use_deepseek_thinking"] is True
+    assert api.last_call_kwargs["reasoning_effort"] == "max"

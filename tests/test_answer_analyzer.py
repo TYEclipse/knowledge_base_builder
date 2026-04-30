@@ -61,8 +61,15 @@ class MemoryMarkdownWriter:
 
 
 def test_answer_analyzer_run_success_path():
-    stats = SimpleNamespace(total_api_calls=0, total_input_tokens=0, total_output_tokens=0)
-    analyzer = AnswerAnalyzer(topic="AI", api_client=DummyApiClient(False), logger=SimpleNamespace(), stats=stats)
+    stats = SimpleNamespace(
+        total_api_calls=0, total_input_tokens=0, total_output_tokens=0
+    )
+    analyzer = AnswerAnalyzer(
+        topic="AI",
+        api_client=DummyApiClient(False),
+        logger=SimpleNamespace(),
+        stats=stats,
+    )
 
     writer = MemoryWriter()
     md_writer = MemoryMarkdownWriter()
@@ -83,8 +90,15 @@ def test_answer_analyzer_run_success_path():
 
 
 def test_answer_analyzer_run_fallback_on_parse_error():
-    stats = SimpleNamespace(total_api_calls=0, total_input_tokens=0, total_output_tokens=0)
-    analyzer = AnswerAnalyzer(topic="AI", api_client=DummyApiClient(True), logger=SimpleNamespace(), stats=stats)
+    stats = SimpleNamespace(
+        total_api_calls=0, total_input_tokens=0, total_output_tokens=0
+    )
+    analyzer = AnswerAnalyzer(
+        topic="AI",
+        api_client=DummyApiClient(True),
+        logger=SimpleNamespace(),
+        stats=stats,
+    )
 
     writer = MemoryWriter()
     md_writer = MemoryMarkdownWriter()
@@ -105,8 +119,15 @@ def test_answer_analyzer_run_fallback_on_parse_error():
 
 
 def test_truncate_and_progress_report_branch(capsys):
-    stats = SimpleNamespace(total_api_calls=1, total_input_tokens=2, total_output_tokens=3)
-    analyzer = AnswerAnalyzer(topic="AI", api_client=DummyApiClient(False), logger=SimpleNamespace(), stats=stats)
+    stats = SimpleNamespace(
+        total_api_calls=1, total_input_tokens=2, total_output_tokens=3
+    )
+    analyzer = AnswerAnalyzer(
+        topic="AI",
+        api_client=DummyApiClient(False),
+        logger=SimpleNamespace(),
+        stats=stats,
+    )
 
     assert analyzer._truncate("abc", 10) == "abc"
     assert "截断" in analyzer._truncate("x" * 50, 5)
@@ -117,15 +138,26 @@ def test_truncate_and_progress_report_branch(capsys):
 
 
 def test_answer_analyzer_search_exception_branch_and_cost_report(monkeypatch):
-    stats = SimpleNamespace(total_api_calls=0, total_input_tokens=0, total_output_tokens=0)
-    analyzer = AnswerAnalyzer(topic="AI", api_client=DummyApiClientSearchFail(True), logger=SimpleNamespace(), stats=stats)
+    stats = SimpleNamespace(
+        total_api_calls=0, total_input_tokens=0, total_output_tokens=0
+    )
+    analyzer = AnswerAnalyzer(
+        topic="AI",
+        api_client=DummyApiClientSearchFail(True),
+        logger=SimpleNamespace(),
+        stats=stats,
+    )
 
     writer = MemoryWriter()
     md_writer = MemoryMarkdownWriter()
     calls = []
 
     monkeypatch.setattr(aa, "COST_REPORT_INTERVAL", 1)
-    monkeypatch.setattr(AnswerAnalyzer, "_print_progress_report", staticmethod(lambda *args, **kwargs: calls.append(True)))
+    monkeypatch.setattr(
+        AnswerAnalyzer,
+        "_print_progress_report",
+        staticmethod(lambda *args, **kwargs: calls.append(True)),
+    )
 
     analyzer.run(
         questions=[{"id": 1, "level": "beginner", "question": "Q1"}],
@@ -140,3 +172,34 @@ def test_answer_analyzer_search_exception_branch_and_cost_report(monkeypatch):
     assert len(writer.records) == 1
     assert "搜索阶段失败" in writer.records[0][0]["analysis"]
     assert calls
+
+
+def test_analyzer_routes_search_and_analysis_modes():
+    class TrackingApiClient(DummyApiClient):
+        def __init__(self):
+            super().__init__(False)
+            self.calls = []
+
+        def call(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs.get("enable_web_search"):
+                return SimpleNamespace(kind="search")
+            return SimpleNamespace(kind="analyze")
+
+    api = TrackingApiClient()
+    analyzer = AnswerAnalyzer(
+        topic="AI",
+        api_client=api,
+        logger=SimpleNamespace(),
+        stats=SimpleNamespace(
+            total_api_calls=0, total_input_tokens=0, total_output_tokens=0
+        ),
+        reasoning_effort="max",
+    )
+
+    _ = analyzer._search_context("Q1", "summary", 1, 1)
+    _ = analyzer._analyze(1, "beginner", "Q1", "summary", "search", 1, 1)
+
+    assert api.calls[0]["enable_web_search"] is True
+    assert api.calls[1]["use_deepseek_thinking"] is True
+    assert api.calls[1]["reasoning_effort"] == "max"

@@ -22,11 +22,19 @@ from models import PHASE3_SCHEMA, JsonlRecordFactory, Phase3Response
 class AnswerAnalyzer:
     """问题分析器。"""
 
-    def __init__(self, topic: str, api_client: Any, logger: Any, stats: Any) -> None:
+    def __init__(
+        self,
+        topic: str,
+        api_client: Any,
+        logger: Any,
+        stats: Any,
+        reasoning_effort: str = "max",
+    ) -> None:
         self.topic = topic
         self.api_client = api_client
         self.logger = logger
         self.stats = stats
+        self.reasoning_effort = reasoning_effort
 
     @staticmethod
     def _truncate(text: str, limit: int) -> str:
@@ -95,6 +103,8 @@ class AnswerAnalyzer:
             user_prompt=analysis_prompt,
             enable_json_mode=True,
             max_tokens=PHASE3_ANALYSIS_MAX_TOKENS,
+            use_deepseek_thinking=True,
+            reasoning_effort=self.reasoning_effort,
             progress_context={
                 "stage_name": "逐题深度分析",
                 "stage_index": 3,

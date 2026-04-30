@@ -49,6 +49,10 @@ class KnowledgeBaseBuilder:
             api_key=settings.api_key,
             base_url=settings.base_url,
             model_name=settings.model_name,
+            deepseek_api_key=settings.deepseek_api_key,
+            deepseek_base_url=settings.deepseek_base_url,
+            deepseek_model_name=settings.deepseek_model_name,
+            deepseek_reasoning_effort=settings.deepseek_reasoning_effort,
             enable_stream=settings.stream,
             logger=self.logger,
             stats=self.stats,
@@ -74,11 +78,13 @@ class KnowledgeBaseBuilder:
             api_client=self.api_client,
             logger=self.logger,
         )
+        self.question_generator.reasoning_effort = settings.deepseek_reasoning_effort
         self.answer_analyzer = AnswerAnalyzer(
             topic=settings.topic,
             api_client=self.api_client,
             logger=self.logger,
             stats=self.stats,
+            reasoning_effort="max",
         )
 
         self.research_summary = ""

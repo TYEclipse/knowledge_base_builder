@@ -94,6 +94,10 @@ def make_settings(tmp_path: Path, api_key: str = "k"):
         model_name="kimi-k2.6",
         base_url="https://api.moonshot.cn/v1",
         api_key=api_key,
+        deepseek_model_name="deepseek-v4-pro",
+        deepseek_base_url="https://api.deepseek.com",
+        deepseek_api_key="ds-test",
+        deepseek_reasoning_effort="high",
     )
 
 
