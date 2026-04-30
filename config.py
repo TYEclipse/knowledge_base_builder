@@ -1,9 +1,11 @@
 """项目配置与通用校验模块。"""
+
 from __future__ import annotations
 
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -55,6 +57,38 @@ class SensitiveDataFilter(logging.Filter):
         return True
 
 
+class InPlaceProgressHandler(logging.StreamHandler):
+    """支持同一行覆盖刷新的控制台日志处理器。"""
+
+    def __init__(self) -> None:
+        super().__init__(stream=sys.stderr)
+        self._overwrite_active = False
+        self._last_overwrite_length = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            overwrite = bool(getattr(record, "overwrite", False))
+
+            if overwrite:
+                padding = max(self._last_overwrite_length - len(message), 0)
+                self.stream.write("\r" + message + (" " * padding))
+                self.flush()
+                self._overwrite_active = True
+                self._last_overwrite_length = len(message)
+                return
+
+            if self._overwrite_active:
+                self.stream.write("\n")
+                self._overwrite_active = False
+                self._last_overwrite_length = 0
+
+            self.stream.write(message + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
 @dataclass
 class Settings:
     """运行时配置。"""
@@ -81,7 +115,7 @@ def setup_logging(verbose: bool, secret: Optional[str] = None) -> logging.Logger
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.handlers.clear()
 
-    handler = logging.StreamHandler()
+    handler = InPlaceProgressHandler()
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%H:%M:%S",
@@ -129,7 +163,9 @@ def derive_markdown_output_dir(output_path: str) -> str:
     return str(path) + "_markdown"
 
 
-def normalize_markdown_output_dir(markdown_output: Optional[str], output_path: str) -> str:
+def normalize_markdown_output_dir(
+    markdown_output: Optional[str], output_path: str
+) -> str:
     """将 markdown 输出参数统一为目录。"""
     if not markdown_output:
         return derive_markdown_output_dir(output_path)
@@ -176,7 +212,9 @@ def build_settings_from_args(args: object, project_root: Path) -> Settings:
     verbose = bool(getattr(args, "verbose"))
 
     api_key = os.getenv("MOONSHOT_API_KEY", "").strip()
-    base_url = os.getenv("MOONSHOT_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
+    base_url = (
+        os.getenv("MOONSHOT_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
+    )
 
     return Settings(
         topic=topic,

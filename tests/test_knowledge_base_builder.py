@@ -300,3 +300,54 @@ def test_run_handles_keyboard_interrupt_gracefully(
     b = kbb.KnowledgeBaseBuilder(make_settings(tmp_path))
     # 不应抛出 KeyboardInterrupt 到测试层
     b.run()
+
+
+def test_phase2_incremental_generation_writes_markdown_per_level_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    events = []
+
+    class TracingWriter(DummyWriter):
+        def append(self, record, flush=False):
+            super().append(record, flush=flush)
+            events.append(("append", record.get("level")))
+
+    class TracingMarkdownWriter(DummyMarkdownWriter):
+        def write_question_list(self, level_en, level_cn, questions):
+            super().write_question_list(level_en, level_cn, questions)
+            events.append(("markdown", level_en))
+
+    class IncrementalQuestionGenerator:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate_incrementally(self, summary):
+            yield (
+                [{"id": 1, "level": "beginner", "question": "Q1"}],
+                {"level": "beginner", "questions": ["Q1"]},
+            )
+            assert events == [
+                ("append", "beginner"),
+                ("markdown", "beginner"),
+            ]
+            yield (
+                [{"id": 2, "level": "intermediate", "question": "Q2"}],
+                {"level": "intermediate", "questions": ["Q2"]},
+            )
+
+    monkeypatch.setattr(kbb, "KimiApiClient", DummyApiClient)
+    monkeypatch.setattr(kbb, "AtomicJsonlWriter", TracingWriter)
+    monkeypatch.setattr(kbb, "MarkdownWriter", TracingMarkdownWriter)
+    monkeypatch.setattr(kbb, "QuestionGenerator", IncrementalQuestionGenerator)
+    monkeypatch.setattr(kbb, "AnswerAnalyzer", DummyAnswerAnalyzer)
+
+    b = kbb.KnowledgeBaseBuilder(make_settings(tmp_path))
+    questions = b.phase2_questions("summary")
+
+    assert [q["id"] for q in questions] == [1, 2]
+    assert events == [
+        ("append", "beginner"),
+        ("markdown", "beginner"),
+        ("append", "intermediate"),
+        ("markdown", "intermediate"),
+    ]

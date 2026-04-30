@@ -68,23 +68,34 @@ class KimiApiClient:
         """关闭底层连接。"""
         self.http_client.close()
 
+    def _log(
+        self, level_name: str, message: str, *args: Any, overwrite: bool = False
+    ) -> None:
+        """安全日志输出，兼容测试替身 logger 与可选的单行覆盖模式。"""
+        log_fn = getattr(self.logger, level_name, None)
+        if not callable(log_fn):
+            return
+
+        if overwrite:
+            try:
+                log_fn(message, *args, extra={"overwrite": True})
+                return
+            except TypeError:
+                pass
+
+        log_fn(message, *args)
+
     def _warn(self, message: str, *args: Any) -> None:
         """安全告警日志输出（兼容测试替身 logger）。"""
-        warn_fn = getattr(self.logger, "warning", None)
-        if callable(warn_fn):
-            warn_fn(message, *args)
+        self._log("warning", message, *args)
 
-    def _info(self, message: str, *args: Any) -> None:
+    def _info(self, message: str, *args: Any, overwrite: bool = False) -> None:
         """安全信息日志输出（兼容测试替身 logger）。"""
-        info_fn = getattr(self.logger, "info", None)
-        if callable(info_fn):
-            info_fn(message, *args)
+        self._log("info", message, *args, overwrite=overwrite)
 
     def _debug(self, message: str, *args: Any) -> None:
         """安全调试日志输出（兼容测试替身 logger）。"""
-        debug_fn = getattr(self.logger, "debug", None)
-        if callable(debug_fn):
-            debug_fn(message, *args)
+        self._log("debug", message, *args)
 
     def _record_request_duration(
         self, request_group: Optional[str], duration_seconds: float
@@ -209,6 +220,7 @@ class KimiApiClient:
                         received_chars=state["received_chars"],
                         chunk_count=state["chunk_count"],
                     ),
+                    overwrite=True,
                 )
 
         threading.Thread(target=runner, daemon=True).start()
@@ -468,14 +480,6 @@ class KimiApiClient:
                 if isinstance(chunk_dict.get("usage"), dict):
                     usage_dict = chunk_dict["usage"]
 
-                self._debug(
-                    "🧪 流式分片 | chunk=%d received_chars=%d finish_reason=%s has_tool_delta=%s",
-                    chunk_idx,
-                    state["received_chars"],
-                    choice0.get("finish_reason"),
-                    bool(delta.get("tool_calls")),
-                )
-
             self._record_request_duration(
                 cast(
                     Optional[str],
@@ -516,6 +520,20 @@ class KimiApiClient:
             finish_reason,
             len(tool_calls_accumulator),
         )
+
+        response_content = "".join(content_parts)
+        elapsed = time.monotonic() - start_time
+        if response_content:
+            self._info(
+                "✅ 请求完成：收到 %d 字符，用时 %s",
+                len(response_content),
+                self._format_duration(elapsed),
+            )
+        else:
+            self._info(
+                "✅ 请求完成：已返回响应（空内容），用时 %s",
+                self._format_duration(elapsed),
+            )
 
         return ChatCompletion.model_validate(assembled)
 
