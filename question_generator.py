@@ -34,11 +34,11 @@ class QuestionGenerator:
     ) -> Tuple[str, str]:
         system_prompt = (
             f"你是 {self.topic} 领域的专家。"
-            f"请列出 {self.topic} 的 {level_cn} 100 个问题清单。"
+            f"请列出 {self.topic} 的 {level_cn} 100+ 个问题清单。"
             "只输出 JSON，不要回答问题，不要额外解释。"
         )
         user_prompt = (
-            f"基于调研摘要，生成 {self.topic} 的 {level_cn}（{level_en}）100 个问题。\n\n"
+            f"基于调研摘要，生成 {self.topic} 的 {level_cn}（{level_en}）100+ 个问题。\n\n"
             f"调研摘要：\n{self._truncate(research_summary, MAX_RESEARCH_SUMMARY_PROMPT_CHARS)}\n\n"
             "要求：\n"
             "1. 覆盖核心知识点\n"
@@ -88,11 +88,6 @@ class QuestionGenerator:
             jsonschema.validate(instance=payload, schema=PHASE2_SCHEMA)
 
             questions = list(payload.get("questions", []))
-            while len(questions) < QUESTIONS_PER_LEVEL:
-                questions.append(
-                    f"[{self.topic} {level_cn}] 补充问题 {len(questions) + 1}"
-                )
-            questions = questions[:QUESTIONS_PER_LEVEL]
 
             record = JsonlRecordFactory.phase2(
                 level=payload.get("level", level_en),

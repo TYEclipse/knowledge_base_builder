@@ -41,7 +41,14 @@ class DummyLogger:
         self.messages.append(msg % args)
 
 
-def test_generate_questions_success_padding():
+def test_truncate_returns_ellipsis_when_exceeds_limit():
+    text = "abcdefghijklmnopqrstuvwxyz"
+    out = QuestionGenerator._truncate(text, 5)
+    assert out.startswith("abcde")
+    assert "以下内容已截断" in out
+
+
+def test_generate_questions_success_keeps_original_count():
     logger = DummyLogger()
     gen = QuestionGenerator(
         topic="AI", api_client=DummyApiClientSuccess(), logger=logger
@@ -50,9 +57,9 @@ def test_generate_questions_success_padding():
     all_questions, phase2_records = gen.generate("summary")
 
     assert len(phase2_records) == 3
-    assert len(all_questions) == 300
+    assert len(all_questions) == 6
     assert all_questions[0]["id"] == 1
-    assert all_questions[-1]["id"] == 300
+    assert all_questions[-1]["id"] == 6
 
 
 def test_generate_questions_fallback_on_exception():
@@ -98,8 +105,8 @@ def test_generate_incrementally_emits_level_batches_with_continuous_ids():
 
     assert len(batches) == 3
     assert batches[0][0][0]["id"] == 1
-    assert batches[1][0][0]["id"] == 101
-    assert batches[2][0][0]["id"] == 201
+    assert batches[1][0][0]["id"] == 3
+    assert batches[2][0][0]["id"] == 5
     assert batches[0][1]["level"] == "beginner"
     assert batches[1][1]["level"] == "intermediate"
     assert batches[2][1]["level"] == "advanced"

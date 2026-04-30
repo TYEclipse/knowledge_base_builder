@@ -423,6 +423,83 @@ def test_create_completion_streaming_assembles_tool_calls():
     client.close()
 
 
+def test_create_completion_streaming_normalizes_builtin_function_tool_calls():
+    class StreamClientWithBuiltinToolCalls:
+        def __init__(self):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self._create)
+            )
+
+        def _create(self, **kwargs):
+            assert kwargs["stream"] is True
+            return [
+                DummyChunk(
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "t-web-search-1",
+                                            "type": "builtin_function",
+                                            "builtin_function": {
+                                                "name": "$web_search",
+                                                "arguments": '{"q":"',
+                                            },
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                ),
+                DummyChunk(
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "builtin_function": {"arguments": "哲学"},
+                                        }
+                                    ]
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ],
+                    }
+                ),
+            ]
+
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=True,
+        logger=SimpleNamespace(),
+        stats=None,
+        openai_client=StreamClientWithBuiltinToolCalls(),
+    )
+
+    response = client._create_completion_streaming(
+        {
+            "model": "kimi-k2.6",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    assert response.choices[0].finish_reason == "tool_calls"
+    tool_calls = response.choices[0].message.tool_calls or []
+    assert len(tool_calls) == 1
+    assert tool_calls[0].id == "t-web-search-1"
+    assert tool_calls[0].type == "function"
+    assert tool_calls[0].function.name == "$web_search"
+    assert tool_calls[0].function.arguments == '{"q":"哲学'
+    client.close()
+
+
 def test_call_web_search_loop_success_with_malformed_tool_args():
     stats = SimpleNamespace(
         total_api_calls=0, total_input_tokens=0, total_output_tokens=0
@@ -666,9 +743,9 @@ def test_progress_helpers_format_and_estimate():
         received_chars=20,
         chunk_count=2,
     )
-    assert "第2/3" in msg
-    assert "非流式" in msg
-    assert "ETA:10秒" in msg
+    assert "p:2/3" in msg
+    assert "ns" in msg
+    assert "eta:10秒" in msg
     assert client._display_width(msg) <= 80
     client.close()
 
@@ -697,9 +774,9 @@ def test_format_progress_message_without_history():
         received_chars=0,
         chunk_count=0,
     )
-    assert "非流式" in msg
-    assert "余:2" in msg
-    assert "ETA:未知" in msg
+    assert "ns" in msg
+    assert "r:2" in msg
+    assert "eta:未知" in msg
     assert client._display_width(msg) <= 80
     client.close()
 
@@ -896,8 +973,8 @@ def test_format_progress_message_substep_without_indices_and_substep_remaining()
         received_chars=0,
         chunk_count=0,
     )
-    assert "子:仅名称子任务" in msg1
-    assert "收:0/0块" in msg1
+    assert "sb:仅名称子任务" in msg1
+    assert "rx:0/0" in msg1
     assert client._display_width(msg1) <= 80
 
     msg2 = client._format_progress_message(
@@ -912,7 +989,7 @@ def test_format_progress_message_substep_without_indices_and_substep_remaining()
         received_chars=2,
         chunk_count=1,
     )
-    assert "余:3" in msg2
+    assert "r:3" in msg2
     assert client._display_width(msg2) <= 80
     client.close()
 
@@ -1142,8 +1219,8 @@ def test_create_completion_streaming_only_logs_summary_debug_once():
 
     assert KimiApiClient.extract_message_content(response) == "hello world"
     assert len(logger.debug_calls) == 1
-    assert "流式聚合完成" in logger.debug_calls[0]
-    assert any("请求完成" in msg for msg in logger.info_calls)
+    assert "stream chars=" in logger.debug_calls[0]
+    assert any("done " in msg for msg in logger.info_calls)
     client.close()
 
 
@@ -1183,7 +1260,7 @@ def test_debug_call_and_duration_bucket_trim_and_item_name_progress_branch():
         received_chars=1,
         chunk_count=1,
     )
-    assert "对:显式对象名" in msg
+    assert "it:显式对象名" in msg
     assert client._display_width(msg) <= 80
     client.close()
 
@@ -1277,6 +1354,36 @@ def test_tool_call_to_dict_attribute_fast_path_branch():
     client.close()
 
 
+def test_tool_call_to_dict_supports_builtin_function_model_dump_branch():
+    class BuiltinDumpToolCall:
+        def model_dump(self, exclude_none=True):
+            return {
+                "id": "tc-builtin",
+                "type": "builtin_function",
+                "builtin_function": {
+                    "name": "$web_search",
+                    "arguments": "{}",
+                },
+            }
+
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=False,
+        logger=SimpleNamespace(),
+        stats=None,
+        openai_client=DummyClient('{"ok":true}'),
+    )
+
+    converted = client._tool_call_to_dict(BuiltinDumpToolCall())
+    assert converted["id"] == "tc-builtin"
+    assert converted["type"] == "function"
+    assert converted["function"]["name"] == "$web_search"
+    assert converted["function"]["arguments"] == "{}"
+    client.close()
+
+
 def test_create_completion_streaming_sets_stop_event_when_progress_context_present():
     class StreamClientOneChunk:
         def __init__(self):
@@ -1325,4 +1432,275 @@ def test_create_completion_streaming_sets_stop_event_when_progress_context_prese
     assert created_event["obj"] is not None
     assert created_event["obj"].wait(0) is True
     assert stop_called["ok"] is True
+    client.close()
+
+
+def test_select_runtime_warns_when_deepseek_missing_and_requested():
+    class Logger:
+        def __init__(self):
+            self.warned = False
+
+        def warning(self, *args, **kwargs):
+            self.warned = True
+
+    logger = Logger()
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        deepseek_api_key="",
+        enable_stream=False,
+        logger=logger,
+        stats=None,
+        openai_client=DummyClient('{"ok":true}'),
+    )
+
+    runtime_client, runtime_model, thinking_enabled = client._select_runtime(
+        use_deepseek_thinking=True,
+        enable_web_search=False,
+    )
+    assert runtime_client is client.client
+    assert runtime_model == "kimi-k2.6"
+    assert thinking_enabled is True
+    assert logger.warned is True
+    client.close()
+
+
+def test_log_overwrite_typeerror_falls_back_to_plain_log_call():
+    class Logger:
+        def __init__(self):
+            self.calls = 0
+
+        def info(self, *args, **kwargs):
+            self.calls += 1
+            if kwargs:
+                raise TypeError("no kwargs accepted")
+
+    logger = Logger()
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=False,
+        logger=logger,
+        stats=None,
+        openai_client=DummyClient('{"ok":true}'),
+    )
+
+    client._info("hello", overwrite=True)
+    assert logger.calls == 2
+    client.close()
+
+
+def test_truncate_display_width_zero_and_truncate_path():
+    assert KimiApiClient._truncate_display_width("abc", 0) == ""
+    out = KimiApiClient._truncate_display_width("abcdefgh", 5)
+    assert out.endswith("…")
+
+
+def test_format_progress_message_with_empty_stage_name_branch():
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=False,
+        logger=SimpleNamespace(),
+        stats=None,
+        openai_client=DummyClient('{"ok":true}'),
+    )
+
+    msg = client._format_progress_message(
+        {
+            "stage_name": "",
+            "stream_mode": False,
+        },
+        elapsed_seconds=1.0,
+        received_chars=0,
+        chunk_count=0,
+    )
+    assert "p:" not in msg
+    assert "ns" in msg
+    client.close()
+
+
+def test_log_request_debug_info_with_non_str_content_and_full_ctx():
+    class Logger:
+        def __init__(self):
+            self.last = ""
+
+        def debug(self, message, *args, **kwargs):
+            self.last = message % args
+
+    logger = Logger()
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=False,
+        logger=logger,
+        stats=None,
+        openai_client=DummyClient('{"ok":true}'),
+    )
+
+    client._log_request_debug_info(
+        messages=[
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": ["not-string"]},
+        ],
+        enable_json_mode=False,
+        enable_web_search=False,
+        use_stream=False,
+        max_tokens=10,
+        progress_context={
+            "request_group": "g1",
+            "stage_index": 1,
+            "stage_total": 3,
+            "substep_index": 2,
+            "substep_total": 3,
+            "item_index": 4,
+            "item_total": 9,
+        },
+    )
+
+    assert "g=g1" in logger.last
+    assert "p=1/3" in logger.last
+    assert "s=2/3" in logger.last
+    assert "i=4/9" in logger.last
+    client.close()
+
+
+def test_extract_function_name_args_supports_builtin_and_custom_non_str_args():
+    name1, args1 = KimiApiClient._extract_function_name_args(
+        {"builtin_function": {"name": "$web_search", "arguments": [1, 2, 3]}}
+    )
+    assert name1 == "$web_search"
+    assert args1 == "{}"
+
+    class CustomObj:
+        custom = SimpleNamespace(name="tool_x", arguments=None)
+
+    name2, args2 = KimiApiClient._extract_function_name_args(CustomObj())
+    assert name2 == "tool_x"
+    assert args2 == "{}"
+
+
+def test_create_completion_streaming_with_custom_tool_calls_branch():
+    class StreamClientWithCustomCalls:
+        def __init__(self):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self._create)
+            )
+
+        def _create(self, **kwargs):
+            return [
+                DummyChunk(
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "c1",
+                                            "custom": {
+                                                "name": "tool_a",
+                                                "arguments": "{",
+                                            },
+                                        },
+                                        {
+                                            "index": 1,
+                                            "id": "c2",
+                                            "custom": {
+                                                "name": "tool_b",
+                                            },
+                                        },
+                                    ]
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ]
+                    }
+                )
+            ]
+
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=True,
+        logger=SimpleNamespace(),
+        stats=None,
+        openai_client=StreamClientWithCustomCalls(),
+    )
+
+    resp = client._create_completion_streaming(
+        {
+            "model": "kimi-k2.6",
+            "messages": [{"role": "user", "content": "u"}],
+        }
+    )
+    tool_calls = resp.choices[0].message.tool_calls or []
+    assert len(tool_calls) == 2
+    assert tool_calls[0].function.name == "tool_a"
+    assert tool_calls[0].function.arguments == "{"
+    assert tool_calls[1].function.name == "tool_b"
+    assert tool_calls[1].function.arguments == ""
+    client.close()
+
+
+def test_call_web_search_skips_empty_assistant_history_message_branch():
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=False,
+        logger=SimpleNamespace(),
+        stats=None,
+        openai_client=DummyClient('{"ok":true}'),
+    )
+
+    first = DummyResponse(
+        choices=[
+            DummyChoice(
+                "tool_calls",
+                DummyMessage(
+                    {"role": "assistant", "content": "should be ignored"},
+                    tool_calls=[
+                        DummyToolCall(
+                            {
+                                "id": "tc-empty-assistant",
+                                "function": {
+                                    "name": "$web_search",
+                                    "arguments": "{}",
+                                },
+                            }
+                        )
+                    ],
+                ),
+            )
+        ],
+        usage=None,
+    )
+    second = DummyResponse(
+        choices=[
+            DummyChoice("stop", DummyMessage({"role": "assistant", "content": "ok"}))
+        ],
+        usage=None,
+    )
+
+    calls = []
+
+    def fake_create_completion(
+        messages, enable_json_mode, enable_web_search, max_tokens, progress_context=None
+    ):
+        calls.append(messages)
+        return first if len(calls) == 1 else second
+
+    client._assistant_message_for_history = lambda _msg: {"role": "assistant"}  # type: ignore[method-assign]
+    client._create_completion = fake_create_completion  # type: ignore[method-assign]
+
+    resp = client.call(system_prompt="s", user_prompt="u", enable_web_search=True)
+    assert resp.choices[0].finish_reason == "stop"
+    assert len(calls) == 2
     client.close()
