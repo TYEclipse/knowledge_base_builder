@@ -31,6 +31,39 @@ class ResearchQualityError(Exception):
     """阶段一调研质量不达标异常。"""
 
 
+def _add_boolean_optional_argument(
+    parser: argparse.ArgumentParser,
+    name: str,
+    *,
+    default: bool,
+    help_text: str,
+) -> None:
+    """兼容旧版 argparse 的布尔开关参数。
+
+    新版 Python 使用 BooleanOptionalAction 自动提供 --foo/--no-foo；
+    旧版回退为手动声明两个参数，行为保持一致。
+    """
+    bool_action_cls = getattr(argparse, "BooleanOptionalAction", None)
+    if bool_action_cls is not None:
+        parser.add_argument(
+            name,
+            action=bool_action_cls,
+            default=default,
+            help=help_text,
+        )
+        return
+
+    normalized = name.lstrip("-")
+    parser.add_argument(name, dest=normalized, action="store_true", help=help_text)
+    parser.add_argument(
+        f"--no-{normalized}",
+        dest=normalized,
+        action="store_false",
+        help=help_text,
+    )
+    parser.set_defaults(**{normalized: default})
+
+
 class KnowledgeBaseBuilder:
     """知识库构建主类。"""
 
@@ -326,17 +359,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_QUESTIONS,
         help="最多处理问题数",
     )
-    parser.add_argument(
+    _add_boolean_optional_argument(
+        parser,
         "--stream",
-        action=argparse.BooleanOptionalAction,
         default=True,
-        help="是否启用流式输出",
+        help_text="是否启用流式输出",
     )
-    parser.add_argument(
+    _add_boolean_optional_argument(
+        parser,
         "--verbose",
-        action=argparse.BooleanOptionalAction,
         default=True,
-        help="是否启用详细日志",
+        help_text="是否启用详细日志",
     )
     return parser
 
