@@ -20,6 +20,8 @@ from tenacity import (
 
 from config import (
     CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_DEEPSEEK_MODEL_NAME,
+    DEFAULT_DEEPSEEK_REASONING_EFFORT,
     MAX_WEB_SEARCH_TOOL_ROUNDS,
     READ_TIMEOUT_SECONDS,
     WRITE_TIMEOUT_SECONDS,
@@ -35,14 +37,24 @@ class KimiApiClient:
         api_key: str,
         base_url: str,
         model_name: str,
-        enable_stream: bool,
-        logger: Any,
+        deepseek_api_key: str = "",
+        deepseek_base_url: str = "https://api.deepseek.com",
+        deepseek_model_name: str = DEFAULT_DEEPSEEK_MODEL_NAME,
+        deepseek_reasoning_effort: str = DEFAULT_DEEPSEEK_REASONING_EFFORT,
+        enable_stream: bool = True,
+        logger: Any = None,
         stats: Optional[Any] = None,
         openai_client: Optional[OpenAI] = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url
         self.model_name = model_name
+        self.deepseek_api_key = deepseek_api_key
+        self.deepseek_base_url = deepseek_base_url
+        self.deepseek_model_name = deepseek_model_name or DEFAULT_DEEPSEEK_MODEL_NAME
+        self.deepseek_reasoning_effort = (
+            deepseek_reasoning_effort or DEFAULT_DEEPSEEK_REASONING_EFFORT
+        )
         self.enable_stream = enable_stream
         self.logger = logger
         self.stats = stats
@@ -64,9 +76,45 @@ class KimiApiClient:
             http_client=self.http_client,
         )
 
+        self.deepseek_http_client: Optional[httpx.Client] = None
+        self.deepseek_client: Optional[OpenAI] = None
+        if self.deepseek_api_key:
+            self.deepseek_http_client = httpx.Client(timeout=timeout, trust_env=True)
+            self.deepseek_client = OpenAI(
+                api_key=self.deepseek_api_key,
+                base_url=self.deepseek_base_url,
+                http_client=self.deepseek_http_client,
+            )
+
     def close(self) -> None:
         """关闭底层连接。"""
         self.http_client.close()
+        if self.deepseek_http_client is not None:
+            self.deepseek_http_client.close()
+
+    def _select_runtime(
+        self, use_deepseek_thinking: bool, enable_web_search: bool
+    ) -> tuple[OpenAI, str, bool]:
+        """选择本次请求应使用的客户端、模型与思考模式。"""
+        use_deepseek = (
+            bool(use_deepseek_thinking)
+            and not enable_web_search
+            and self.deepseek_client is not None
+        )
+
+        if use_deepseek:
+            return cast(OpenAI, self.deepseek_client), self.deepseek_model_name, True
+
+        if (
+            use_deepseek_thinking
+            and not enable_web_search
+            and self.deepseek_client is None
+        ):
+            self._warn(
+                "未配置 DEEPSEEK_API_KEY，已回退到 Kimi 模型处理当前非联网请求。"
+            )
+
+        return self.client, self.model_name, (not enable_web_search)
 
     def _log(
         self, level_name: str, message: str, *args: Any, overwrite: bool = False
@@ -345,11 +393,17 @@ class KimiApiClient:
         enable_json_mode: bool,
         enable_web_search: bool,
         max_tokens: Optional[int],
+        use_deepseek_thinking: bool = False,
+        reasoning_effort: Optional[str] = None,
         progress_context: Optional[Dict[str, Any]] = None,
     ) -> ChatCompletion:
         """执行一次聊天请求。"""
+        selected_client, selected_model_name, thinking_enabled = self._select_runtime(
+            use_deepseek_thinking=use_deepseek_thinking,
+            enable_web_search=enable_web_search,
+        )
         kwargs: Dict[str, Any] = {
-            "model": self.model_name,
+            "model": selected_model_name,
             "messages": messages,
         }
         if max_tokens is not None:
@@ -359,8 +413,13 @@ class KimiApiClient:
             kwargs["response_format"] = {"type": "json_object"}
 
         kwargs["extra_body"] = {
-            "thinking": {"type": "disabled" if enable_web_search else "enabled"}
+            "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
         }
+
+        if selected_client is self.deepseek_client and thinking_enabled:
+            kwargs["reasoning_effort"] = (
+                reasoning_effort or self.deepseek_reasoning_effort
+            )
 
         if enable_web_search:
             kwargs["tools"] = [
@@ -382,9 +441,18 @@ class KimiApiClient:
 
         if use_stream:
             try:
-                return self._create_completion_streaming(
-                    kwargs, progress_context=heartbeat_context
-                )
+                try:
+                    return self._create_completion_streaming(
+                        kwargs,
+                        selected_client=selected_client,
+                        selected_model_name=selected_model_name,
+                        progress_context=heartbeat_context,
+                    )
+                except TypeError:
+                    # 兼容测试中对该方法的旧签名 monkeypatch。
+                    return self._create_completion_streaming(
+                        kwargs, progress_context=heartbeat_context
+                    )
             except KeyboardInterrupt:
                 # 用户主动中断时直接上抛，由上层统一优雅退出。
                 raise
@@ -394,7 +462,7 @@ class KimiApiClient:
         stop_event, _, start_time = self._start_progress_heartbeat(heartbeat_context)
         try:
             response = cast(
-                ChatCompletion, self.client.chat.completions.create(**kwargs)
+                ChatCompletion, selected_client.chat.completions.create(**kwargs)
             )
             elapsed = time.monotonic() - start_time
             self._record_request_duration(
@@ -426,12 +494,18 @@ class KimiApiClient:
                 stop_event.set()
 
     def _create_completion_streaming(
-        self, kwargs: Dict[str, Any], progress_context: Optional[Dict[str, Any]] = None
+        self,
+        kwargs: Dict[str, Any],
+        selected_client: Optional[OpenAI] = None,
+        selected_model_name: Optional[str] = None,
+        progress_context: Optional[Dict[str, Any]] = None,
     ) -> ChatCompletion:
         """流式聚合结果。"""
+        runtime_client = selected_client or self.client
+        runtime_model_name = selected_model_name or self.model_name
         stream_kwargs = dict(kwargs)
         stream_kwargs["stream"] = True
-        stream = cast(Any, self.client.chat.completions.create(**stream_kwargs))
+        stream = cast(Any, runtime_client.chat.completions.create(**stream_kwargs))
         stop_event, state, start_time = self._start_progress_heartbeat(progress_context)
 
         content_parts: List[str] = []
@@ -495,7 +569,7 @@ class KimiApiClient:
             "id": f"stream-assembled-{int(time.time() * 1000)}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": self.model_name,
+            "model": runtime_model_name,
             "choices": [
                 {
                     "index": 0,
@@ -552,6 +626,8 @@ class KimiApiClient:
         enable_json_mode: bool = False,
         enable_web_search: bool = False,
         max_tokens: Optional[int] = None,
+        use_deepseek_thinking: bool = False,
+        reasoning_effort: Optional[str] = None,
         progress_context: Optional[Dict[str, Any]] = None,
     ) -> ChatCompletion:
         """统一 API 调用入口。"""
@@ -560,13 +636,30 @@ class KimiApiClient:
             {"role": "user", "content": user_prompt},
         ]
 
-        response = self._create_completion(
-            messages=messages,
-            enable_json_mode=enable_json_mode,
-            enable_web_search=enable_web_search,
-            max_tokens=max_tokens,
-            progress_context=progress_context,
-        )
+        def invoke_create(
+            current_messages: List[Dict[str, Any]], web_search: bool
+        ) -> ChatCompletion:
+            try:
+                return self._create_completion(
+                    messages=current_messages,
+                    enable_json_mode=enable_json_mode,
+                    enable_web_search=web_search,
+                    max_tokens=max_tokens,
+                    use_deepseek_thinking=use_deepseek_thinking,
+                    reasoning_effort=reasoning_effort,
+                    progress_context=progress_context,
+                )
+            except TypeError:
+                # 兼容测试中对该方法的旧签名 monkeypatch。
+                return self._create_completion(
+                    messages=current_messages,
+                    enable_json_mode=enable_json_mode,
+                    enable_web_search=web_search,
+                    max_tokens=max_tokens,
+                    progress_context=progress_context,
+                )
+
+        response = invoke_create(messages, enable_web_search)
 
         if enable_web_search:
             for _ in range(MAX_WEB_SEARCH_TOOL_ROUNDS):
@@ -601,13 +694,7 @@ class KimiApiClient:
                         }
                     )
 
-                response = self._create_completion(
-                    messages=messages,
-                    enable_json_mode=enable_json_mode,
-                    enable_web_search=enable_web_search,
-                    max_tokens=max_tokens,
-                    progress_context=progress_context,
-                )
+                response = invoke_create(messages, enable_web_search)
 
             if response.choices and response.choices[0].finish_reason == "tool_calls":
                 # 回合耗尽时，强制收敛为最终回答，避免阶段1直接失败。
@@ -618,13 +705,7 @@ class KimiApiClient:
                         "content": "请基于已经获取到的工具结果，直接给出最终回答，不要继续调用任何工具。",
                     }
                 )
-                response = self._create_completion(
-                    messages=messages,
-                    enable_json_mode=enable_json_mode,
-                    enable_web_search=False,
-                    max_tokens=max_tokens,
-                    progress_context=progress_context,
-                )
+                response = invoke_create(messages, False)
 
                 if (
                     response.choices

@@ -44,6 +44,10 @@ def test_build_settings_from_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MOONSHOT_API_KEY", "k-test")
     monkeypatch.setenv("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-test")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    monkeypatch.setenv("DEEPSEEK_MODEL_NAME", "deepseek-v4-pro")
+    monkeypatch.setenv("DEEPSEEK_REASONING_EFFORT", "medium")
 
     args = SimpleNamespace(
         topic="LLM",
@@ -61,6 +65,10 @@ def test_build_settings_from_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert settings.api_key == "k-test"
     assert settings.max_questions == 10
     assert settings.output_path.endswith("out.jsonl")
+    assert settings.deepseek_api_key == "ds-test"
+    assert settings.deepseek_base_url == "https://api.deepseek.com"
+    assert settings.deepseek_model_name == "deepseek-v4-pro"
+    assert settings.deepseek_reasoning_effort == "high"
 
 
 def test_sensitive_data_filter_masks_secret_and_env_key():

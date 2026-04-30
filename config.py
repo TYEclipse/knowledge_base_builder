@@ -14,6 +14,9 @@ from dotenv import load_dotenv  # type: ignore[import-not-found]
 
 DEFAULT_MODEL_NAME = "kimi-k2.6"
 DEFAULT_BASE_URL = "https://api.moonshot.cn/v1"
+DEFAULT_DEEPSEEK_MODEL_NAME = "deepseek-v4-pro"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_DEEPSEEK_REASONING_EFFORT = "high"
 DEFAULT_OUTPUT = "./knowledge_base.jsonl"
 DEFAULT_AUDIENCE = "beginner"
 DEFAULT_MAX_QUESTIONS = 300
@@ -105,6 +108,11 @@ class Settings:
     model_name: str = DEFAULT_MODEL_NAME
     base_url: str = DEFAULT_BASE_URL
     api_key: str = ""
+
+    deepseek_model_name: str = DEFAULT_DEEPSEEK_MODEL_NAME
+    deepseek_base_url: str = DEFAULT_DEEPSEEK_BASE_URL
+    deepseek_api_key: str = ""
+    deepseek_reasoning_effort: str = DEFAULT_DEEPSEEK_REASONING_EFFORT
 
     project_root: Path = Path.cwd()
 
@@ -215,6 +223,26 @@ def build_settings_from_args(args: object, project_root: Path) -> Settings:
     base_url = (
         os.getenv("MOONSHOT_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
     )
+    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    deepseek_base_url = (
+        os.getenv("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).strip()
+        or DEFAULT_DEEPSEEK_BASE_URL
+    )
+    deepseek_model_name = (
+        os.getenv("DEEPSEEK_MODEL_NAME", DEFAULT_DEEPSEEK_MODEL_NAME).strip()
+        or DEFAULT_DEEPSEEK_MODEL_NAME
+    )
+    deepseek_reasoning_effort = (
+        os.getenv("DEEPSEEK_REASONING_EFFORT", DEFAULT_DEEPSEEK_REASONING_EFFORT)
+        .strip()
+        .lower()
+    )
+    if deepseek_reasoning_effort in {"max", "xhigh"}:
+        deepseek_reasoning_effort = "max"
+    elif deepseek_reasoning_effort in {"high", "medium", "low"}:
+        deepseek_reasoning_effort = "high"
+    else:
+        deepseek_reasoning_effort = DEFAULT_DEEPSEEK_REASONING_EFFORT
 
     return Settings(
         topic=topic,
@@ -228,5 +256,9 @@ def build_settings_from_args(args: object, project_root: Path) -> Settings:
         model_name=DEFAULT_MODEL_NAME,
         base_url=base_url,
         api_key=api_key,
+        deepseek_model_name=deepseek_model_name,
+        deepseek_base_url=deepseek_base_url,
+        deepseek_api_key=deepseek_api_key,
+        deepseek_reasoning_effort=deepseek_reasoning_effort,
         project_root=project_root,
     )

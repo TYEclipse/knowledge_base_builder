@@ -141,6 +141,54 @@ def test_create_completion_non_stream_builds_kwargs():
     client.close()
 
 
+def test_create_completion_uses_deepseek_with_reasoning_effort_when_enabled():
+    kimi_captures = []
+    deepseek_captures = []
+
+    class CaptureClient:
+        def __init__(self, captures):
+            self.captures = captures
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self._create)
+            )
+
+        def _create(self, **kwargs):
+            self.captures.append(kwargs)
+            return DummyResponse(choices=[], usage=None)
+
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        deepseek_api_key="ds",
+        deepseek_base_url="https://api.deepseek.com",
+        deepseek_model_name="deepseek-v4-pro",
+        deepseek_reasoning_effort="max",
+        enable_stream=False,
+        logger=SimpleNamespace(),
+        stats=None,
+        openai_client=CaptureClient(kimi_captures),
+    )
+    client.deepseek_client = CaptureClient(deepseek_captures)
+
+    client._create_completion(
+        messages=[{"role": "user", "content": "hello"}],
+        enable_json_mode=False,
+        enable_web_search=False,
+        max_tokens=256,
+        use_deepseek_thinking=True,
+        reasoning_effort="max",
+    )
+
+    assert len(kimi_captures) == 0
+    assert len(deepseek_captures) == 1
+    kwargs = deepseek_captures[0]
+    assert kwargs["model"] == "deepseek-v4-pro"
+    assert kwargs["reasoning_effort"] == "max"
+    assert kwargs["extra_body"]["thinking"]["type"] == "enabled"
+    client.close()
+
+
 def test_create_completion_json_mode_enables_stream_when_enabled(monkeypatch):
     captures = []
 
