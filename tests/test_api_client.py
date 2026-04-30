@@ -666,9 +666,10 @@ def test_progress_helpers_format_and_estimate():
         received_chars=20,
         chunk_count=2,
     )
-    assert "第2/3阶段" in msg
-    assert "当前为非流式请求" in msg
-    assert "预计剩余 10秒" in msg
+    assert "第2/3" in msg
+    assert "非流式" in msg
+    assert "ETA:10秒" in msg
+    assert client._display_width(msg) <= 80
     client.close()
 
 
@@ -696,9 +697,10 @@ def test_format_progress_message_without_history():
         received_chars=0,
         chunk_count=0,
     )
-    assert "当前为非流式请求" in msg
-    assert "本阶段剩余约 2 项" in msg
-    assert "预计剩余 未知" in msg
+    assert "非流式" in msg
+    assert "余:2" in msg
+    assert "ETA:未知" in msg
+    assert client._display_width(msg) <= 80
     client.close()
 
 
@@ -894,8 +896,9 @@ def test_format_progress_message_substep_without_indices_and_substep_remaining()
         received_chars=0,
         chunk_count=0,
     )
-    assert "子任务：仅名称子任务" in msg1
-    assert "尚未收到内容" in msg1
+    assert "子:仅名称子任务" in msg1
+    assert "收:0/0块" in msg1
+    assert client._display_width(msg1) <= 80
 
     msg2 = client._format_progress_message(
         {
@@ -909,7 +912,8 @@ def test_format_progress_message_substep_without_indices_and_substep_remaining()
         received_chars=2,
         chunk_count=1,
     )
-    assert "本阶段剩余约 3 项" in msg2
+    assert "余:3" in msg2
+    assert client._display_width(msg2) <= 80
     client.close()
 
 
@@ -1179,7 +1183,40 @@ def test_debug_call_and_duration_bucket_trim_and_item_name_progress_branch():
         received_chars=1,
         chunk_count=1,
     )
-    assert "对象：显式对象名" in msg
+    assert "对:显式对象名" in msg
+    assert client._display_width(msg) <= 80
+    client.close()
+
+
+def test_format_progress_message_truncates_to_80_display_width_for_long_names():
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=True,
+        logger=SimpleNamespace(),
+        stats=None,
+        openai_client=DummyClient('{"ok":true}'),
+    )
+
+    msg = client._format_progress_message(
+        {
+            "stage_name": "逐题深度分析阶段名称非常非常长用于测试截断",
+            "stage_index": 3,
+            "stage_total": 3,
+            "substep_name": "这是一个特别长的子任务名称用于测试",
+            "substep_index": 2,
+            "substep_total": 9,
+            "item_name": "哲学的核心问题域有哪些以及其历史演化路径是什么",
+            "request_group": "phase3_analysis",
+            "stream_mode": True,
+        },
+        elapsed_seconds=123.0,
+        received_chars=9999,
+        chunk_count=8888,
+    )
+
+    assert client._display_width(msg) <= 80
     client.close()
 
 
