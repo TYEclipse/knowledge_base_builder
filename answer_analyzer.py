@@ -50,7 +50,7 @@ class AnswerAnalyzer:
             f"主题：{self.topic}\n"
             f"阶段1调研摘要：{self._truncate(research_summary, MAX_SEARCH_RESULT_PROMPT_CHARS)}\n"
             f"问题：{question}\n\n"
-            "输出精简摘要：定义、关键结论、核心事实，最多5条要点。"
+            "输出精简摘要：定义、关键结论、核心事实。"
         )
         response = self.api_client.call(
             system_prompt=f"你是 {self.topic} 领域专家，擅长基于检索做事实归纳。",

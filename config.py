@@ -68,17 +68,26 @@ class InPlaceProgressHandler(logging.StreamHandler):
         self._overwrite_active = False
         self._last_overwrite_length = 0
 
+    @staticmethod
+    def _display_width(text: str) -> int:
+        """计算文本显示宽度（中文等宽字符按 2 计）。"""
+        width = 0
+        for ch in text:
+            width += 2 if ord(ch) > 127 else 1
+        return width
+
     def emit(self, record: logging.LogRecord) -> None:
         try:
             message = self.format(record)
             overwrite = bool(getattr(record, "overwrite", False))
 
             if overwrite:
-                padding = max(self._last_overwrite_length - len(message), 0)
+                current_width = self._display_width(message)
+                padding = max(self._last_overwrite_length - current_width, 0)
                 self.stream.write("\r" + message + (" " * padding))
                 self.flush()
                 self._overwrite_active = True
-                self._last_overwrite_length = len(message)
+                self._last_overwrite_length = current_width
                 return
 
             if self._overwrite_active:
@@ -125,7 +134,7 @@ def setup_logging(verbose: bool, secret: Optional[str] = None) -> logging.Logger
 
     handler = InPlaceProgressHandler()
     formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        "%(asctime)s|%(levelname).1s|%(message)s",
         datefmt="%H:%M:%S",
     )
     handler.setFormatter(formatter)

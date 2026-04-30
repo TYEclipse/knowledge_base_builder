@@ -229,23 +229,25 @@ class KimiApiClient:
         request_group = progress_context.get("request_group")
         stream_mode = bool(progress_context.get("stream_mode", False))
 
-        stage_part = self._truncate_display_width(stage_name, 16)
+        stage_part = ""
         if stage_index and stage_total:
-            stage_part = f"第{stage_index}/{stage_total} {stage_part}"
+            stage_part = f"p:{stage_index}/{stage_total}"
+        elif stage_name:
+            stage_part = f"p:{self._truncate_display_width(stage_name, 8)}"
 
         extra_parts: List[str] = []
         if substep_name:
             substep_part = self._truncate_display_width(str(substep_name), 12)
             if substep_index and substep_total:
                 extra_parts.append(
-                    f"子:{substep_part}({substep_index}/{substep_total})"
+                    f"sb:{substep_part}({substep_index}/{substep_total})"
                 )
             else:
-                extra_parts.append(f"子:{substep_part}")
+                extra_parts.append(f"sb:{substep_part}")
         if item_name:
-            extra_parts.append(f"对:{self._truncate_display_width(str(item_name), 14)}")
+            extra_parts.append(f"it:{self._truncate_display_width(str(item_name), 12)}")
         elif item_index and item_total:
-            extra_parts.append(f"对:{item_index}/{item_total}")
+            extra_parts.append(f"it:{item_index}/{item_total}")
 
         remaining_items: Optional[int] = None
         if item_index and item_total:
@@ -257,21 +259,21 @@ class KimiApiClient:
             cast(Optional[str], request_group), elapsed_seconds
         )
         if stream_mode:
-            chunks_text = f"收:{received_chars}/{chunk_count}块"
+            chunks_text = f"rx:{received_chars}/{chunk_count}"
         else:
-            chunks_text = "非流式"
+            chunks_text = "ns"
 
         parts = [
-            f"⏳{stage_part}",
+            stage_part,
             *extra_parts,
-            f"等:{self._format_duration(elapsed_seconds)}",
+            f"t:{self._format_duration(elapsed_seconds)}",
             chunks_text,
         ]
         if remaining_items is not None:
-            parts.append(f"余:{remaining_items}")
-        parts.append(f"ETA:{self._format_duration(eta)}")
+            parts.append(f"r:{remaining_items}")
+        parts.append(f"eta:{self._format_duration(eta)}")
 
-        message = " | ".join(parts)
+        message = " | ".join([p for p in parts if p])
         return self._truncate_display_width(message, 80)
 
     def _start_progress_heartbeat(
@@ -325,8 +327,33 @@ class KimiApiClient:
                     elif role == "system":
                         system_prompt_len += len(content)
 
+            compact_ctx = "-"
+            if progress_context:
+                ctx_parts: List[str] = []
+                if progress_context.get("request_group"):
+                    ctx_parts.append(f"g={progress_context.get('request_group')}")
+                if progress_context.get("stage_index") and progress_context.get(
+                    "stage_total"
+                ):
+                    ctx_parts.append(
+                        f"p={progress_context.get('stage_index')}/{progress_context.get('stage_total')}"
+                    )
+                if progress_context.get("substep_index") and progress_context.get(
+                    "substep_total"
+                ):
+                    ctx_parts.append(
+                        f"s={progress_context.get('substep_index')}/{progress_context.get('substep_total')}"
+                    )
+                if progress_context.get("item_index") and progress_context.get(
+                    "item_total"
+                ):
+                    ctx_parts.append(
+                        f"i={progress_context.get('item_index')}/{progress_context.get('item_total')}"
+                    )
+                compact_ctx = ",".join(ctx_parts) if ctx_parts else "-"
+
             self._debug(
-                "🧪 请求参数 | stream=%s json_mode=%s web_search=%s max_tokens=%s messages=%d system_chars=%d user_chars=%d progress=%s",
+                "req s=%s j=%s w=%s tok=%s m=%d sc=%d uc=%d ctx=%s",
                 use_stream,
                 enable_json_mode,
                 enable_web_search,
@@ -334,19 +361,61 @@ class KimiApiClient:
                 len(messages),
                 system_prompt_len,
                 user_prompt_len,
-                progress_context or {},
+                compact_ctx,
             )
         except Exception as exc:  # pragma: no cover - 调试日志不应影响主流程
             self._warn("调试日志输出失败（已忽略）：%s", exc)
 
     @staticmethod
+    def _normalize_tool_call_type(raw_type: Any) -> str:
+        """将供应商差异化工具类型归一化到 SDK 可接受集合。"""
+        # Kimi 联网工具常返回 builtin_function；为保证历史兼容与稳定，统一收敛到 function。
+        return "function"
+
+    @staticmethod
+    def _extract_function_name_args(tool_like: Any) -> tuple[str, str]:
+        """从不同形态的工具调用对象中提取函数名与参数字符串。"""
+        candidates: List[Any] = []
+
+        fn_obj = getattr(tool_like, "function", None)
+        if fn_obj is not None:
+            candidates.append(fn_obj)
+
+        builtin_obj = getattr(tool_like, "builtin_function", None)
+        if builtin_obj is not None:
+            candidates.append(builtin_obj)
+
+        custom_obj = getattr(tool_like, "custom", None)
+        if custom_obj is not None:
+            candidates.append(custom_obj)
+
+        if isinstance(tool_like, dict):
+            for key in ("function", "builtin_function", "custom"):
+                value = tool_like.get(key)
+                if value is not None:
+                    candidates.append(value)
+
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                name = candidate.get("name")
+                arguments = candidate.get("arguments")
+            else:
+                name = getattr(candidate, "name", None)
+                arguments = getattr(candidate, "arguments", None)
+
+            if isinstance(name, str) and name:
+                if isinstance(arguments, str):
+                    return name, arguments
+                return name, "{}"
+
+        return "", "{}"
+
+    @staticmethod
     def _tool_call_to_dict(tool_call: Any) -> Dict[str, Any]:
         """将 SDK 工具调用对象转换为稳定字典结构。"""
         # 优先使用属性访问，避免直接序列化触发 pydantic 告警。
-        fn_obj = getattr(tool_call, "function", None)
         tc_id = getattr(tool_call, "id", "")
-        fn_name = getattr(fn_obj, "name", "") if fn_obj is not None else ""
-        fn_args = getattr(fn_obj, "arguments", "{}") if fn_obj is not None else "{}"
+        fn_name, fn_args = KimiApiClient._extract_function_name_args(tool_call)
 
         if tc_id or fn_name:
             return {
@@ -361,15 +430,16 @@ class KimiApiClient:
         model_dump = getattr(tool_call, "model_dump", None)
         if callable(model_dump):
             dumped = model_dump(exclude_none=True)
-            fn = dumped.get("function", {}) if isinstance(dumped, dict) else {}
+            fn_name, fn_args = KimiApiClient._extract_function_name_args(dumped)
+            normalized_type = KimiApiClient._normalize_tool_call_type(
+                dumped.get("type") if isinstance(dumped, dict) else None
+            )
             return {
                 "id": dumped.get("id", "") if isinstance(dumped, dict) else "",
-                "type": "function",
+                "type": normalized_type,
                 "function": {
-                    "name": fn.get("name", "") if isinstance(fn, dict) else "",
-                    "arguments": (
-                        fn.get("arguments", "{}") if isinstance(fn, dict) else "{}"
-                    ),
+                    "name": fn_name,
+                    "arguments": fn_args,
                 },
             }
 
@@ -486,7 +556,7 @@ class KimiApiClient:
                 raise
             except Exception as exc:
                 # 网络抖动或流式通道异常时，自动降级为非流式请求，提升可用性。
-                self._warn("流式请求失败，已降级为非流式重试：%s", exc)
+                self._warn("stream fallback: %s", exc)
         stop_event, _, start_time = self._start_progress_heartbeat(heartbeat_context)
         try:
             response = cast(
@@ -507,13 +577,13 @@ class KimiApiClient:
             response_content = self.extract_message_content(response, default="")
             if response_content:
                 self._info(
-                    "✅ 请求完成：收到 %d 字符，用时 %s",
+                    "done chars=%d t=%s",
                     len(response_content),
                     self._format_duration(elapsed),
                 )
             else:
                 self._info(
-                    "✅ 请求完成：已返回响应（空内容），用时 %s",
+                    "done empty t=%s",
                     self._format_duration(elapsed),
                 )
             return response
@@ -560,14 +630,21 @@ class KimiApiClient:
                         idx,
                         {
                             "id": tc.get("id", ""),
-                            "type": tc.get("type", "function") or "function",
+                            "type": self._normalize_tool_call_type(tc.get("type")),
                             "function": {"name": "", "arguments": ""},
                         },
                     )
                     if tc.get("id"):
                         current["id"] = tc.get("id")
+                    current["type"] = self._normalize_tool_call_type(tc.get("type"))
 
-                    fn = tc.get("function", {})
+                    fn = tc.get("function")
+                    if not isinstance(fn, dict):
+                        fn = tc.get("builtin_function")
+                    if not isinstance(fn, dict):
+                        fn = tc.get("custom")
+                    if not isinstance(fn, dict):
+                        fn = {}
                     if isinstance(fn, dict):
                         name = fn.get("name")
                         if isinstance(name, str) and name:
@@ -616,7 +693,7 @@ class KimiApiClient:
             assembled["usage"] = usage_dict
 
         self._debug(
-            "🧪 流式聚合完成 | chars=%d chunks=%d finish_reason=%s tool_calls=%d",
+            "stream chars=%d chunks=%d fr=%s tc=%d",
             len("".join(content_parts)),
             state["chunk_count"],
             finish_reason,
@@ -627,13 +704,13 @@ class KimiApiClient:
         elapsed = time.monotonic() - start_time
         if response_content:
             self._info(
-                "✅ 请求完成：收到 %d 字符，用时 %s",
+                "done chars=%d t=%s",
                 len(response_content),
                 self._format_duration(elapsed),
             )
         else:
             self._info(
-                "✅ 请求完成：已返回响应（空内容），用时 %s",
+                "done empty t=%s",
                 self._format_duration(elapsed),
             )
 
