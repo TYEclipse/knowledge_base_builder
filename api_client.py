@@ -179,6 +179,36 @@ class KimiApiClient:
             return f"{minutes}分{secs:02d}秒"
         return f"{secs}秒"
 
+    @staticmethod
+    def _display_width(text: str) -> int:
+        """计算文本显示宽度（中文等宽字符按 2 计）。"""
+        width = 0
+        for ch in text:
+            width += 2 if ord(ch) > 127 else 1
+        return width
+
+    @classmethod
+    def _truncate_display_width(cls, text: str, max_width: int) -> str:
+        """按显示宽度截断文本，超限时追加省略号。"""
+        if max_width <= 0:
+            return ""
+        if cls._display_width(text) <= max_width:
+            return text
+
+        ellipsis = "…"
+        ellipsis_width = cls._display_width(ellipsis)
+        budget = max(max_width - ellipsis_width, 0)
+
+        current_width = 0
+        chars: List[str] = []
+        for ch in text:
+            ch_width = 2 if ord(ch) > 127 else 1
+            if current_width + ch_width > budget:
+                break
+            chars.append(ch)
+            current_width += ch_width
+        return "".join(chars) + ellipsis
+
     def _format_progress_message(
         self,
         progress_context: Dict[str, Any],
@@ -186,7 +216,7 @@ class KimiApiClient:
         received_chars: int,
         chunk_count: int,
     ) -> str:
-        """构造心跳进度消息。"""
+        """构造心跳进度消息（控制单行显示宽度不超过 80）。"""
         stage_name = str(progress_context.get("stage_name", "未知阶段"))
         stage_index = progress_context.get("stage_index")
         stage_total = progress_context.get("stage_total")
@@ -199,22 +229,23 @@ class KimiApiClient:
         request_group = progress_context.get("request_group")
         stream_mode = bool(progress_context.get("stream_mode", False))
 
-        stage_part = stage_name
+        stage_part = self._truncate_display_width(stage_name, 16)
         if stage_index and stage_total:
-            stage_part = f"第{stage_index}/{stage_total}阶段 {stage_name}"
+            stage_part = f"第{stage_index}/{stage_total} {stage_part}"
 
         extra_parts: List[str] = []
         if substep_name:
+            substep_part = self._truncate_display_width(str(substep_name), 12)
             if substep_index and substep_total:
                 extra_parts.append(
-                    f"子任务：{substep_name}（{substep_index}/{substep_total}）"
+                    f"子:{substep_part}({substep_index}/{substep_total})"
                 )
             else:
-                extra_parts.append(f"子任务：{substep_name}")
+                extra_parts.append(f"子:{substep_part}")
         if item_name:
-            extra_parts.append(f"对象：{item_name}")
+            extra_parts.append(f"对:{self._truncate_display_width(str(item_name), 14)}")
         elif item_index and item_total:
-            extra_parts.append(f"对象：{item_index}/{item_total}")
+            extra_parts.append(f"对:{item_index}/{item_total}")
 
         remaining_items: Optional[int] = None
         if item_index and item_total:
@@ -226,25 +257,22 @@ class KimiApiClient:
             cast(Optional[str], request_group), elapsed_seconds
         )
         if stream_mode:
-            chunks_text = (
-                f"，已收 {received_chars} 字符 / {chunk_count} chunks"
-                if received_chars or chunk_count
-                else "，尚未收到内容"
-            )
+            chunks_text = f"收:{received_chars}/{chunk_count}块"
         else:
-            chunks_text = "，当前为非流式请求，结果将在服务端完成后一次性返回"
-        remaining_text = (
-            f"，本阶段剩余约 {remaining_items} 项"
-            if remaining_items is not None
-            else ""
-        )
-        return (
-            f"⏳ {stage_part}"
-            f"{' | ' + ' | '.join(extra_parts) if extra_parts else ''}"
-            f" | 已等待 {self._format_duration(elapsed_seconds)}"
-            f"{chunks_text}{remaining_text}"
-            f" | 预计剩余 {self._format_duration(eta)}"
-        )
+            chunks_text = "非流式"
+
+        parts = [
+            f"⏳{stage_part}",
+            *extra_parts,
+            f"等:{self._format_duration(elapsed_seconds)}",
+            chunks_text,
+        ]
+        if remaining_items is not None:
+            parts.append(f"余:{remaining_items}")
+        parts.append(f"ETA:{self._format_duration(eta)}")
+
+        message = " | ".join(parts)
+        return self._truncate_display_width(message, 80)
 
     def _start_progress_heartbeat(
         self, progress_context: Optional[Dict[str, Any]]
