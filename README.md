@@ -187,6 +187,28 @@ python -m pip install openai tenacity tqdm
 pip config list
 ```
 
+### 6.5 怀疑 `$web_search` 没有正常调用，如何打开调试日志
+
+在 `.env` 中增加以下配置（推荐）：
+
+```dotenv
+# 开启联网工具调试日志
+KIMI_TOOL_DEBUG=1
+
+# 单条调试日志最大字符数（可选，默认 800）
+KIMI_TOOL_DEBUG_MAX_CHARS=1200
+```
+
+开启后会输出：
+
+- 每一轮 `finish_reason=tool_calls` 的轮次与工具数量
+- 每个工具调用的 `id/name/arguments`（截断预览）
+- `$web_search` 返回参数中的 `usage.total_tokens`（若有）
+- 回填给 `role=tool` 的 `content`（截断预览）
+- 联网完成后的 `prompt/completion/total tokens`
+
+> 调试日志默认关闭；只有 `KIMI_TOOL_DEBUG=1` 时才会输出。
+
 ---
 
 ## 7. 退出虚拟环境

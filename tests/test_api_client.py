@@ -1704,3 +1704,75 @@ def test_call_web_search_skips_empty_assistant_history_message_branch():
     assert resp.choices[0].finish_reason == "stop"
     assert len(calls) == 2
     client.close()
+
+
+def test_call_web_search_tool_debug_logs_tool_round_and_tokens():
+    class Logger:
+        def __init__(self):
+            self.debug_logs = []
+
+        def debug(self, message, *args, **kwargs):
+            self.debug_logs.append(message % args)
+
+    logger = Logger()
+    client = KimiApiClient(
+        api_key="k",
+        base_url="https://api.moonshot.cn/v1",
+        model_name="kimi-k2.6",
+        enable_stream=False,
+        logger=logger,
+        stats=None,
+        openai_client=DummyClient('{"ok":true}'),
+        tool_debug=True,
+        tool_debug_max_chars=300,
+    )
+
+    first = DummyResponse(
+        choices=[
+            DummyChoice(
+                "tool_calls",
+                DummyMessage(
+                    {"role": "assistant", "content": "need tool"},
+                    tool_calls=[
+                        DummyToolCall(
+                            {
+                                "id": "tc-debug-1",
+                                "function": {
+                                    "name": "$web_search",
+                                    "arguments": '{"query":"AI Agent","usage":{"total_tokens":1234}}',
+                                },
+                            }
+                        )
+                    ],
+                ),
+            )
+        ],
+        usage=None,
+    )
+
+    second = DummyResponse(
+        choices=[
+            DummyChoice("stop", DummyMessage({"role": "assistant", "content": "done"}))
+        ],
+        usage=SimpleNamespace(prompt_tokens=9, completion_tokens=3, total_tokens=12),
+    )
+
+    state = {"count": 0}
+
+    def fake_create_completion(
+        messages, enable_json_mode, enable_web_search, max_tokens, progress_context=None
+    ):
+        state["count"] += 1
+        return first if state["count"] == 1 else second
+
+    client._create_completion = fake_create_completion  # type: ignore[method-assign]
+
+    resp = client.call(system_prompt="s", user_prompt="u", enable_web_search=True)
+
+    assert resp.choices[0].finish_reason == "stop"
+    merged_logs = "\n".join(logger.debug_logs)
+    assert "web_search round=1" in merged_logs
+    assert "tool[1/1] id=tc-debug-1" in merged_logs
+    assert "search_content_total_tokens=1234" in merged_logs
+    assert "web_search final_usage prompt=9 completion=3 total=12" in merged_logs
+    client.close()

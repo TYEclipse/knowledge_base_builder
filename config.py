@@ -113,6 +113,8 @@ class Settings:
     max_questions: int = DEFAULT_MAX_QUESTIONS
     stream: bool = True
     verbose: bool = True
+    tool_debug: bool = False
+    tool_debug_max_chars: int = 800
 
     model_name: str = DEFAULT_MODEL_NAME
     base_url: str = DEFAULT_BASE_URL
@@ -253,6 +255,16 @@ def build_settings_from_args(args: object, project_root: Path) -> Settings:
     else:
         deepseek_reasoning_effort = DEFAULT_DEEPSEEK_REASONING_EFFORT
 
+    tool_debug_raw = os.getenv("KIMI_TOOL_DEBUG", "0").strip().lower()
+    tool_debug = tool_debug_raw in {"1", "true", "yes", "on"}
+    try:
+        tool_debug_max_chars = int(
+            os.getenv("KIMI_TOOL_DEBUG_MAX_CHARS", "800").strip() or "800"
+        )
+    except ValueError:
+        tool_debug_max_chars = 800
+    tool_debug_max_chars = min(max(tool_debug_max_chars, 120), 10_000)
+
     return Settings(
         topic=topic,
         audience=audience,
@@ -262,6 +274,8 @@ def build_settings_from_args(args: object, project_root: Path) -> Settings:
         max_questions=max_questions,
         stream=stream,
         verbose=verbose,
+        tool_debug=tool_debug,
+        tool_debug_max_chars=tool_debug_max_chars,
         model_name=DEFAULT_MODEL_NAME,
         base_url=base_url,
         api_key=api_key,

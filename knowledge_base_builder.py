@@ -10,8 +10,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from api_client import KimiApiClient
 from answer_analyzer import AnswerAnalyzer
+from api_client import KimiApiClient
 from config import (
     DEFAULT_AUDIENCE,
     DEFAULT_MAX_QUESTIONS,
@@ -89,7 +89,15 @@ class KnowledgeBaseBuilder:
             enable_stream=settings.stream,
             logger=self.logger,
             stats=self.stats,
+            tool_debug=bool(getattr(settings, "tool_debug", False)),
+            tool_debug_max_chars=int(getattr(settings, "tool_debug_max_chars", 800)),
         )
+
+        if bool(getattr(settings, "tool_debug", False)):
+            self.logger.info(
+                "已启用联网工具调试日志（KIMI_TOOL_DEBUG=1, max_chars=%d）。",
+                int(getattr(settings, "tool_debug_max_chars", 800)),
+            )
 
         output_path = Path(settings.output_path)
         markdown_dir = Path(
