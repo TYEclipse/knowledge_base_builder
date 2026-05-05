@@ -110,7 +110,7 @@ class Settings:
     output_path: str = DEFAULT_OUTPUT
     markdown_output: Optional[str] = None
     resume: int = 0
-    max_questions: int = DEFAULT_MAX_QUESTIONS
+    max_questions: Optional[int] = None
     stream: bool = True
     verbose: bool = True
     tool_debug: bool = False
@@ -166,11 +166,11 @@ def sanitize_topic(topic: str) -> str:
     return clean
 
 
-def validate_numeric_args(resume: int, max_questions: int) -> None:
+def validate_numeric_args(resume: int, max_questions: Optional[int]) -> None:
     """校验数值参数。"""
     if resume < 0:
         raise ValueError("--resume 不能为负数。")
-    if max_questions <= 0:
+    if max_questions is not None and max_questions <= 0:
         raise ValueError("--max-questions 必须大于 0。")
 
 
@@ -222,7 +222,8 @@ def build_settings_from_args(args: object, project_root: Path) -> Settings:
         raise ValueError("--audience 必须是 beginner/intermediate/advanced。")
 
     resume = int(getattr(args, "resume"))
-    max_questions = int(getattr(args, "max_questions"))
+    raw_max_questions = getattr(args, "max_questions")
+    max_questions = None if raw_max_questions is None else int(raw_max_questions)
     validate_numeric_args(resume=resume, max_questions=max_questions)
 
     output_path = secure_output_path(str(getattr(args, "output")), project_root)

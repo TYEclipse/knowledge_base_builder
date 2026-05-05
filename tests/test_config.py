@@ -23,6 +23,7 @@ def test_sanitize_topic_and_numeric_validation():
         config.validate_numeric_args(-1, 1)
     with pytest.raises(ValueError):
         config.validate_numeric_args(0, 0)
+    config.validate_numeric_args(0, None)
 
 
 def test_path_helpers_and_secure_output(tmp_path: Path):
@@ -97,6 +98,27 @@ def test_build_settings_tool_debug_invalid_max_chars_uses_default(
     settings = config.build_settings_from_args(args, tmp_path)
     assert settings.tool_debug is True
     assert settings.tool_debug_max_chars == 800
+
+
+def test_build_settings_without_max_questions_keeps_unlimited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "k-test")
+
+    args = SimpleNamespace(
+        topic="LLM",
+        audience="beginner",
+        output="out.jsonl",
+        markdown_output=None,
+        resume=0,
+        max_questions=None,
+        stream=True,
+        verbose=False,
+    )
+
+    settings = config.build_settings_from_args(args, tmp_path)
+    assert settings.max_questions is None
 
 
 def test_sensitive_data_filter_masks_secret_and_env_key():

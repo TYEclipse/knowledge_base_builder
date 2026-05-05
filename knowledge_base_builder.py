@@ -14,7 +14,6 @@ from answer_analyzer import AnswerAnalyzer
 from api_client import KimiApiClient
 from config import (
     DEFAULT_AUDIENCE,
-    DEFAULT_MAX_QUESTIONS,
     DEFAULT_OUTPUT,
     MIN_RESEARCH_SUMMARY_BYTES,
     PHASE1_MAX_TOKENS,
@@ -281,7 +280,12 @@ class KnowledgeBaseBuilder:
         print(f"受众：{self.settings.audience}")
         print(f"输出：{self.settings.output_path}")
         print(f"断点续传：{self.settings.resume}")
-        print(f"最大问题数：{self.settings.max_questions}")
+        max_questions_display = (
+            str(self.settings.max_questions)
+            if self.settings.max_questions is not None
+            else "不限制（按实际生成数量处理）"
+        )
+        print(f"最大问题数：{max_questions_display}")
         print("=" * 60)
 
         try:
@@ -298,9 +302,12 @@ class KnowledgeBaseBuilder:
             else:
                 questions = self.phase2_questions(self.research_summary)
 
-            self._print_cost_estimate(
-                num_questions=min(len(questions), self.settings.max_questions)
+            analysis_count = (
+                min(len(questions), self.settings.max_questions)
+                if self.settings.max_questions is not None
+                else len(questions)
             )
+            self._print_cost_estimate(num_questions=analysis_count)
 
             print("\n" + "=" * 60)
             print("🧠 阶段 3：逐题深度分析")
@@ -364,8 +371,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-questions",
         type=int,
-        default=DEFAULT_MAX_QUESTIONS,
-        help="最多处理问题数",
+        default=None,
+        help="最多处理问题数（不设置则处理全部）",
     )
     _add_boolean_optional_argument(
         parser,

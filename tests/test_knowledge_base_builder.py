@@ -402,3 +402,52 @@ def test_phase2_incremental_generation_resume_nonzero_skips_markdown_write(
     qs = b.phase2_questions("summary")
     assert len(qs) == 1
     assert cast(Any, b.markdown_writer).calls == []
+
+
+def test_run_without_max_questions_uses_all_generated_questions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    class TwoQuestionGenerator:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate(self, summary):
+            return (
+                [
+                    {"id": 1, "level": "beginner", "question": "Q1"},
+                    {"id": 2, "level": "advanced", "question": "Q2"},
+                ],
+                [{"level": "beginner", "questions": ["Q1", "Q2"]}],
+            )
+
+    class TrackingAnswerAnalyzer(DummyAnswerAnalyzer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.kwargs = None
+
+        def run(self, **kwargs):
+            self.called = True
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(kbb, "KimiApiClient", DummyApiClient)
+    monkeypatch.setattr(kbb, "AtomicJsonlWriter", DummyWriter)
+    monkeypatch.setattr(kbb, "MarkdownWriter", DummyMarkdownWriter)
+    monkeypatch.setattr(kbb, "QuestionGenerator", TwoQuestionGenerator)
+    monkeypatch.setattr(kbb, "AnswerAnalyzer", TrackingAnswerAnalyzer)
+
+    settings = make_settings(tmp_path)
+    settings.max_questions = None
+    b = kbb.KnowledgeBaseBuilder(settings)
+
+    captured: dict[str, int] = {}
+    monkeypatch.setattr(
+        b,
+        "_print_cost_estimate",
+        lambda num_questions: captured.setdefault("num_questions", num_questions),
+    )
+
+    b.run()
+
+    assert captured["num_questions"] == 2
+    assert cast(Any, b.answer_analyzer).kwargs["max_questions"] is None
+    assert len(cast(Any, b.answer_analyzer).kwargs["questions"]) == 2

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from tqdm import tqdm
 
@@ -125,14 +125,14 @@ class AnswerAnalyzer:
 
     @staticmethod
     def _print_progress_report(
-        completed: int, max_questions: int, stats: Any, start_time: float
+        completed: int, total_questions: int, stats: Any, start_time: float
     ) -> None:
         import time
 
         elapsed = time.time() - start_time
         print("\n" + "-" * 60)
         print(f"⏱️  已运行时间：{elapsed:.1f} 秒")
-        print(f"✅ 已完成问题：{completed} / {max_questions}")
+        print(f"✅ 已完成问题：{completed} / {total_questions}")
         print(f"📡 API 调用次数：{stats.total_api_calls}")
         print(f"📝 累计输入 Token：{stats.total_input_tokens:,}")
         print(f"📝 累计输出 Token：{stats.total_output_tokens:,}")
@@ -143,15 +143,16 @@ class AnswerAnalyzer:
         questions: List[Dict[str, Any]],
         research_summary: str,
         resume_from: int,
-        max_questions: int,
+        max_questions: Optional[int],
         writer: Any,
         markdown_writer: Any,
         start_time: float,
     ) -> None:
         """执行阶段三分析。"""
-        questions = questions[:max_questions]
         start_index = max(0, resume_from)
         questions = questions[start_index:]
+        if max_questions is not None:
+            questions = questions[:max_questions]
 
         pbar = tqdm(total=len(questions), desc="深度分析进度", unit="题", ncols=80)
 
@@ -220,7 +221,7 @@ class AnswerAnalyzer:
             if idx % COST_REPORT_INTERVAL == 0:
                 self._print_progress_report(
                     completed=idx,
-                    max_questions=max_questions,
+                    total_questions=total_items,
                     stats=self.stats,
                     start_time=start_time,
                 )
