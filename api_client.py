@@ -23,9 +23,9 @@ from config import (
     DEFAULT_DEEPSEEK_MODEL_NAME,
     DEFAULT_DEEPSEEK_REASONING_EFFORT,
     MAX_WEB_SEARCH_TOOL_ROUNDS,
+    POOL_TIMEOUT_SECONDS,
     READ_TIMEOUT_SECONDS,
     WRITE_TIMEOUT_SECONDS,
-    POOL_TIMEOUT_SECONDS,
 )
 
 
@@ -45,6 +45,8 @@ class KimiApiClient:
         logger: Any = None,
         stats: Optional[Any] = None,
         openai_client: Optional[OpenAI] = None,
+        tool_debug: bool = False,
+        tool_debug_max_chars: int = 800,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url
@@ -58,6 +60,8 @@ class KimiApiClient:
         self.enable_stream = enable_stream
         self.logger = logger
         self.stats = stats
+        self.tool_debug = tool_debug
+        self.tool_debug_max_chars = max(int(tool_debug_max_chars), 120)
         self.progress_heartbeat_seconds = 10.0
         self._request_durations: Dict[str, List[float]] = {}
 
@@ -144,6 +148,44 @@ class KimiApiClient:
     def _debug(self, message: str, *args: Any) -> None:
         """安全调试日志输出（兼容测试替身 logger）。"""
         self._log("debug", message, *args)
+
+    def _tool_debug(self, message: str, *args: Any) -> None:
+        """联网工具调试日志（可开关，默认关闭）。"""
+        if not self.tool_debug:
+            return
+        self._debug(message, *args)
+
+    def _to_debug_preview(self, value: Any) -> str:
+        """将调试对象转为短文本，避免日志过长。"""
+        try:
+            if isinstance(value, str):
+                text = value
+            else:
+                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            text = str(value)
+
+        if len(text) <= self.tool_debug_max_chars:
+            return text
+        return text[: self.tool_debug_max_chars] + "...(truncated)"
+
+    @staticmethod
+    def _extract_search_tokens_from_arguments(arguments_obj: Any) -> Optional[int]:
+        """从 $web_search 参数中提取搜索产生的 token 数。"""
+        if not isinstance(arguments_obj, dict):
+            return None
+
+        usage = arguments_obj.get("usage")
+        if not isinstance(usage, dict):
+            return None
+
+        total_tokens = usage.get("total_tokens")
+        if not isinstance(total_tokens, (int, float, str)):
+            return None
+        try:
+            return int(total_tokens)
+        except (TypeError, ValueError):
+            return None
 
     def _record_request_duration(
         self, request_group: Optional[str], duration_seconds: float
@@ -523,6 +565,12 @@ class KimiApiClient:
             kwargs["tools"] = [
                 {"type": "builtin_function", "function": {"name": "$web_search"}}
             ]
+            self._tool_debug(
+                "web_search request model=%s thinking=%s tools=%s",
+                selected_model_name,
+                "enabled" if thinking_enabled else "disabled",
+                self._to_debug_preview(kwargs["tools"]),
+            )
 
         # 统一优先流式，若通道异常则自动降级为非流式，保证稳定性。
         use_stream = self.enable_stream
@@ -767,7 +815,7 @@ class KimiApiClient:
         response = invoke_create(messages, enable_web_search)
 
         if enable_web_search:
-            for _ in range(MAX_WEB_SEARCH_TOOL_ROUNDS):
+            for round_idx in range(1, MAX_WEB_SEARCH_TOOL_ROUNDS + 1):
                 if not response.choices:
                     break
                 choice = response.choices[0]
@@ -777,18 +825,48 @@ class KimiApiClient:
                 if not tool_calls:
                     break
 
+                self._tool_debug(
+                    "web_search round=%d finish_reason=%s tool_calls=%d",
+                    round_idx,
+                    choice.finish_reason,
+                    len(tool_calls),
+                )
+
                 assistant_msg = self._assistant_message_for_history(choice.message)
                 if "content" in assistant_msg or "tool_calls" in assistant_msg:
                     messages.append(assistant_msg)
 
-                for tool_call in tool_calls:
+                for tool_idx, tool_call in enumerate(tool_calls, start=1):
                     tc = self._tool_call_to_dict(tool_call)
                     fn = tc.get("function", {})
                     args = fn.get("arguments", "{}")
+                    parsed_arguments: Any = None
+                    parsed_ok = False
                     try:
-                        tool_payload = json.dumps(json.loads(args), ensure_ascii=False)
+                        parsed_arguments = json.loads(args)
+                        parsed_ok = True
+                        tool_payload = json.dumps(parsed_arguments, ensure_ascii=False)
                     except Exception:
                         tool_payload = str(args)
+
+                    self._tool_debug(
+                        "web_search tool[%d/%d] id=%s name=%s args=%s",
+                        tool_idx,
+                        len(tool_calls),
+                        tc.get("id", ""),
+                        fn.get("name", ""),
+                        self._to_debug_preview(parsed_arguments if parsed_ok else args),
+                    )
+                    search_tokens = self._extract_search_tokens_from_arguments(
+                        parsed_arguments if parsed_ok else None
+                    )
+                    if search_tokens is not None:
+                        self._tool_debug(
+                            "web_search tool[%d/%d] search_content_total_tokens=%d",
+                            tool_idx,
+                            len(tool_calls),
+                            search_tokens,
+                        )
 
                     messages.append(
                         {
@@ -799,7 +877,23 @@ class KimiApiClient:
                         }
                     )
 
+                    self._tool_debug(
+                        "web_search tool[%d/%d] tool_payload=%s",
+                        tool_idx,
+                        len(tool_calls),
+                        self._to_debug_preview(tool_payload),
+                    )
+
                 response = invoke_create(messages, enable_web_search)
+                if response.choices:
+                    self._tool_debug(
+                        "web_search round=%d next_finish_reason=%s assistant_content=%s",
+                        round_idx,
+                        response.choices[0].finish_reason,
+                        self._to_debug_preview(
+                            self.extract_message_content(response, default="")
+                        ),
+                    )
 
             if response.choices and response.choices[0].finish_reason == "tool_calls":
                 # 回合耗尽时，强制收敛为最终回答，避免阶段1直接失败。
@@ -817,6 +911,15 @@ class KimiApiClient:
                     and response.choices[0].finish_reason == "tool_calls"
                 ):
                     raise RuntimeError("联网工具调用超过最大回合数，且强制收敛失败。")
+
+            usage = response.usage
+            if usage is not None:
+                self._tool_debug(
+                    "web_search final_usage prompt=%s completion=%s total=%s",
+                    getattr(usage, "prompt_tokens", None),
+                    getattr(usage, "completion_tokens", None),
+                    getattr(usage, "total_tokens", None),
+                )
 
         if self.stats is not None:
             self.stats.total_api_calls += 1
