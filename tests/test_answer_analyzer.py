@@ -203,3 +203,35 @@ def test_analyzer_routes_search_and_analysis_modes():
     assert api.calls[0]["enable_web_search"] is True
     assert api.calls[1]["use_deepseek_thinking"] is True
     assert api.calls[1]["reasoning_effort"] == "max"
+
+
+def test_answer_analyzer_run_without_max_questions_processes_all_items():
+    stats = SimpleNamespace(
+        total_api_calls=0, total_input_tokens=0, total_output_tokens=0
+    )
+    analyzer = AnswerAnalyzer(
+        topic="AI",
+        api_client=DummyApiClient(False),
+        logger=SimpleNamespace(),
+        stats=stats,
+    )
+
+    writer = MemoryWriter()
+    md_writer = MemoryMarkdownWriter()
+
+    analyzer.run(
+        questions=[
+            {"id": 1, "level": "beginner", "question": "Q1"},
+            {"id": 2, "level": "intermediate", "question": "Q2"},
+        ],
+        research_summary="summary",
+        resume_from=0,
+        max_questions=None,
+        writer=writer,
+        markdown_writer=md_writer,
+        start_time=time.time(),
+    )
+
+    assert len(writer.records) == 2
+    assert len(md_writer.records) == 2
+    assert all(record[0]["type"] == "analysis" for record in writer.records)
