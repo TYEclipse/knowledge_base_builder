@@ -14,7 +14,7 @@
 
 - OS：Windows 11 / Ubuntu / macOS
 - Python：3.8 - 3.12
-- 工具：pytest、GitHub Actions
+- 工具：pytest
 
 ## 4. 测试用例清单
 
@@ -29,7 +29,7 @@
 ## 5. 通过准则
 
 - pytest 全部通过
-- CI 三个 Python 版本任务通过
+- pytest 测试通过
 - 无阻塞级（P0）缺陷
 
 ## 6. 后续建议

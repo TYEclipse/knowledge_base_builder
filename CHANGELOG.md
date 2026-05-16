@@ -7,7 +7,7 @@
 - 新增模块化架构：`config.py`、`api_client.py`、`question_generator.py`、`answer_analyzer.py`、`models.py`、`storage.py`
 - 新增 JSON Schema 校验（Phase2/Phase3）
 - 新增 JSONL 原子写入器（临时文件 + 替换）
-- 新增 pytest 测试与 GitHub Actions CI
+- 新增 pytest 测试
 - 新增工程文档：INSTALL / ARCHITECTURE / API_REFERENCE / TEST_PLAN / CONTRIBUTING / SECURITY
 
 ### Changed
