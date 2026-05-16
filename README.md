@@ -229,7 +229,6 @@ deactivate
 - `models.py`：Pydantic 数据模型与 JSON Schema
 - `storage.py`：JSONL 原子写入与 Markdown 输出
 - `tests/`：pytest 单元测试
-- `.github/workflows/ci.yml`：CI 自动化测试
 - `.env`：本地私有配置（自动加载，不要提交）
 - `.env.example`：环境变量示例模板（可提交）
 - `.gitignore`：Git 忽略规则（已包含 `.env`）
@@ -243,7 +242,7 @@ deactivate
 
 - **Reliability（可靠性）**：tenacity 指数退避重试、请求超时控制、JSON Schema 响应校验、JSONL 原子写入。
 - **Maintainability（可维护性）**：模块化拆分、面向对象主流程、完整类型注解与 Google-style docstring、结构化日志。
-- **Testability（可测试性）**：pytest 单测、可注入客户端便于 Mock、CI 自动执行测试。
+- **Testability（可测试性）**：pytest 单测、可注入客户端便于 Mock，便于本地执行测试。
 - **Portability（可移植性）**：兼容 Windows/Linux/macOS，支持 Python 3.8-3.12，支持代理环境变量。
 - **Security（安全性）**：API Key 仅环境变量/.env、日志脱敏、输出路径安全检查（防路径穿越）。
 - **Usability（易用性）**：文档补齐（INSTALL/ARCHITECTURE/API_REFERENCE/TEST_PLAN 等），CLI 参数说明与错误提示优化。
